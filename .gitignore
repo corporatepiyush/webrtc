@@ -53,3 +53,16 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# Fuzzing: logs and crash artifacts (corpora and dictionaries are tracked)
+fuzz/run/
+fuzz/artifacts/
+
+# Generated fuzz corpus: fuzzer-discovered inputs have 40-hex-char names.
+# Hand-written seeds (*.bin, *.sdp, seed*) are tracked.
+fuzz/corpus/**/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
