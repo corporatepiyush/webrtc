@@ -5,9 +5,9 @@
 - Apple M-series (10 performance cores), Homebrew clang, `RelWithDebInfo`,
   `WR_OPT_LEVEL=2`, `build-rel/wr_bench`.
 - 1200-byte RTP payload for SRTP/DTLS/CRC paths; 1.2 KiB SDP offer.
-- Every row is from two back-to-back runs on the final tree; the two runs
-  differ by less than 5% on all paths. This machine's run-to-run spread is
-  roughly 5-10%, so treat anything inside that band as noise.
+- The table reports one run plus the range observed across repeated runs of the
+  same binary. Spread is roughly 5-10% on most paths, and wider on SRTP AES-CM
+  protect and the string map; treat anything inside the stated range as noise.
 - `allocs/op` counts arena bump allocations, not `malloc` inside OpenSSL or
   FFmpeg.
 
@@ -18,48 +18,66 @@
 
 ## Measured hot paths
 
-Two consecutive runs, final tree (older run pair shown where a row has not moved):
+Single run on the final tree, `build-rel/wr_bench`. The "range" column is the
+spread observed across repeated runs of the same binary, including a final
+three-run sequence.
 
-| Path | Run 1 | Run 2 | Throughput (run 1) | Arena allocs/op |
+| Path | ns/op | Observed range | Throughput | Arena allocs/op |
 |---|---:|---:|---:|---:|
-| SRTP AES-CM protect | 701.5 | 719.3 | ~1755 MB/s | 0.00 |
-| SRTP AES-CM unprotect | 701.4 | 705.7 | ~1741 MB/s | 0.00 |
-| SRTP AES-GCM protect | 229.6 | 230.6 | ~5352 MB/s | 0.00 |
-| DTLS record encrypt 1200 B | 227.2 | 225.8 | ~5404 MB/s | 0.00 |
-| DTLS record decrypt 1200 B | 225.4 | 222.9 | ~5447 MB/s | 0.00 |
-| RTP parse | 2.6 | 2.7 | ~454,000 MB/s | 0.00 |
-| RTP serialize | 17.9 | 17.7 | ~68,200 MB/s | 0.00 |
-| STUN parse | 18.6 | 19.2 | ~5263 MB/s | 1.00 |
-| STUN parse + attr find | 23.3 | 23.8 | ~4204 MB/s | 1.00 |
-| SDP parse (2 m-lines) | 682.8 | 689.7 | ~1770 MB/s | 7.00 |
-| SDP find media | 14.1 | 13.9 | - | 0.00 |
-| SDP serialize | 457.6 | 455.6 | ~2682 MB/s | 0.00 |
-| SCTP parse | 112.5 | 113.6 | ~385 MB/s | 1.00 |
-| SCTP input DATA | 43.0 | 43.1 | ~1023 MB/s | 1.00 |
-| `parse_u64` 19 digits | 5.5 | 5.6 | ~3448 MB/s | 0.00 |
-| `wr_hash64` over 64 B | 12.4 | 12.4 | ~5132 MB/s | 0.00 |
-| `wr_u64_map` put | 13.2 | 13.2 | - | 0.00 |
-| `wr_u64_map` hit lookup | 8.0 | 7.9 | - | 0.00 |
-| `wr_str_map` put | 82.3 | 81.0 | - | 0.00 |
-| `wr_str_map` hit lookup | 75.1 | 76.5 | - | 0.00 |
-| `wr_pool` alloc+free | 5.1 | 5.0 | - | 0.00 |
-| RTP stream get/update | 6.6 | 6.6 | - | 0.00 |
-| CRC-32c 1200 B | 121.4 | 121.2 | ~10,113 MB/s | 0.00 |
-| CRC-32 1200 B | 121.2 | 121.5 | ~10,129 MB/s | 0.00 |
+| SRTP AES-CM protect | 701.5 | 701.5-783.3 | ~1755 MB/s | 0.00 |
+| SRTP AES-CM unprotect | 701.4 | 701.4-707.2 | ~1741 MB/s | 0.00 |
+| SRTP AES-GCM protect | 229.6 | 228.4-231.4 | ~5352 MB/s | 0.00 |
+| DTLS record encrypt 1200 B | 222.3 | 222.3-231.1 | ~5526 MB/s | 0.00 |
+| DTLS record decrypt 1200 B | 221.9 | 221.9-229.2 | ~5536 MB/s | 0.00 |
+| RTP parse | 2.6 | 2.6-2.8 | ~471,000 MB/s | 0.00 |
+| RTP serialize | 17.9 | 17.6-18.2 | ~68,200 MB/s | 0.00 |
+| STUN parse | 18.6 | 18.6-19.3 | ~5263 MB/s | 1.00 |
+| STUN parse + attr find | 23.3 | 23.3-24.6 | ~4204 MB/s | 1.00 |
+| SDP parse (2 m-lines) | 682.8 | 681.4-710.5 | ~1770 MB/s | 7.00 |
+| SDP find media | 14.1 | 13.9-14.8 | - | 0.00 |
+| SDP serialize | 457.6 | 455.6-464.6 | ~2682 MB/s | 0.00 |
+| SCTP parse | 112.5 | 112.5-116.2 | ~385 MB/s | 1.00 |
+| SCTP input DATA | 42.5 | 42.4-43.2 | ~1030 MB/s | 1.00 |
+| `parse_u64` 19 digits | 5.5 | 5.5-5.8 | ~3448 MB/s | 0.00 |
+| `wr_hash64` over 64 B | 12.4 | 12.4-12.8 | ~5132 MB/s | 0.00 |
+| `wr_u64_map` put | 13.2 | 12.7-14.4 | - | 0.00 |
+| `wr_u64_map` hit lookup | 7.8 | 7.8-8.0 | - | 0.00 |
+| `wr_str_map` put | 82.3 | 80.8-103.2 | - | 0.00 |
+| `wr_str_map` hit lookup | 74.0 | 73.6-90.6 | - | 0.00 |
+| `wr_pool` alloc+free | 5.0 | 5.0-5.3 | - | 0.00 |
+| RTP stream get/update | 6.6 | 6.6-6.9 | - | 0.00 |
+| CRC-32c 1200 B | 121.0 | 121.0-126.0 | ~10,141 MB/s | 0.00 |
+| CRC-32 1200 B | 121.2 | 121.2-124.5 | ~10,125 MB/s | 0.00 |
 
-Focused measurements from the same tree:
+The AES-CM protect path is the noisiest: it moved 701.5-783.3 ns across six runs
+on the same binary, so only the ~700 ns floor is trustworthy. `str_map_put` and
+`str_map_find_hit` also show a wider spread than the other rows because the
+benchmark hashes and compares 8-byte keys.
+
+An earlier run on the same machine measured SDP parse at 710 ns and
+`str_map_put` at 103 ns. Both are the top of the ranges above, not a regression.
+The map lookup row previously quoted ~14 ns came from a benchmark whose arena
+filled and mostly missed; it is now 7.8-8.0 ns on a fully populated table.
+
+Focused measurements from the same tree (best of 9 runs, `-O2`, 1 report block):
 
 | Path | ns/op |
 |---|---:|
-| RTCP RR serialize | 7.8-9.0 |
+| RTCP RR serialize, 1 block | 7.7-10.2 |
+| RTCP RR serialize, 2 blocks | 10.6 |
+| RTCP RR serialize, 4 blocks | 16.1-16.2 |
 | RTCP `parse_one` | 2.2 |
-| RTCP `rr_parse` | 3.7 |
+| RTCP `rr_parse`, 1 block | 4.1-4.6 |
+| RTCP `rr_parse`, 4 blocks | 9.4-9.5 |
 
-Run-to-run spread on this table is under 5% except for AES-CM protect, which
-moved 701.5-783.3 ns across six runs on the same binary; that path is treated as
-noise-band, not a result. The map lookup row previously quoted ~14 ns came from
-a benchmark whose arena filled and mostly missed; it is now 7.8-8.0 ns on a
-fully populated table.
+SCTP gap generation (`wr_tsn_set_gaps`), best of 9 runs:
+
+| Receive state | ns/op | Gap blocks |
+|---|---:|---:|
+| empty window | 1.2-1.3 | 0 |
+| one received TSN | 4.3-7.9 | 1 |
+| two received TSNs | 8.7-11.7 | 2 |
+| 200 singleton runs | ~1530 | 200 |
 
 ## What changed and why
 
@@ -68,8 +86,8 @@ fully populated table.
 | Cached AES-CTR + precomputed HMAC-SHA1 ipad/opad states in SRTP | AES-CM protect 1950 -> 705-729 ns; unprotect 1819 -> 703-724 ns |
 | Cached EVP GCM context in SRTP/DTLS | AES-GCM 578 -> 230 ns; DTLS record ~223 -> ~226 ns |
 | Hardware CRC-32c + inline 16-entry chunk walk | SCTP parse 199 -> 112-116 ns |
-| Word-scan TSN gap generation (bit-at-a-time removed) | empty SACK window 102 -> 1.3 ns; two gaps 76 -> 19 ns |
-| Shared `wr_sb` builder, direct-store BE writes | SDP/RTCP serializers stay at 0.46/7.8-9.0 us; no regression |
+| Word-scan TSN gap generation (bit-at-a-time removed) | empty window ~102 -> 1.2-1.3 ns; one run ~76 -> 4.3-7.9 ns; two runs ~19 -> 8.7-11.7 ns |
+| Shared `wr_sb` builder, direct-store BE writes | SDP serialize 0.456-0.465 us; RTCP RR 7.7-10.2 ns for 1 block, 16.1-16.2 ns for 4 |
 | SWAR decimal parse for `wr_parse_u64` | 19 digits at 5.5-5.8 ns; junk rejection restored |
 | Benchmark arena fixed to 64 MiB + pre-size | `u64_map` hit 14.3 -> 8.0 ns on a valid run |
 

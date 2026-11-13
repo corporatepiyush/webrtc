@@ -324,6 +324,8 @@ The target now initializes the cipher.
 
 ## Current hot-path numbers
 
+As measured after this pass:
+
 | Path | ns/op |
 |---|---:|
 | SRTP AES-CM protect | ~828 |
@@ -339,6 +341,11 @@ The target now initializes the cipher.
 | CRC-32c 1200 B | 121 |
 | `u64_map` hit | 7.9 |
 | pool alloc/free | 5.1 |
+
+These were superseded by later runs in the same pass. The current ranges are in
+`docs/PERFORMANCE.md`: AES-CM protect 701.5-783.3 ns, SDP parse 681.4-710.5 ns,
+SCTP parse 112.5-116.2 ns. The 751 ns SDP figure was a single run, not a stable
+value; the ~828 ns AES-CM figure was a single run before the machine settled.
 
 The earlier `u64_map` hit figure (~14 ns) was invalid: the benchmark's 1 MiB
 arena filled after ~11.5k of 100k inserts, so the loop was mostly missing. The
@@ -663,7 +670,11 @@ fully populated windows. `test_sack_gaps` drives a real association: it feeds
 TSNs 1001 and 1003 out of order, reads the wire, parses the SACK chunk, and
 requires `cum = 999`, two gap blocks, and `(1001,1001)` plus `(1003,1003)`.
 
-Measured: empty window ~102 -> 1.3 ns; two gaps ~76 -> 19 ns.
+Measured on the final tree (best of 9 runs): empty window ~1.2-1.3 ns, one
+received TSN ~4.3-7.9 ns, two received TSNs ~8.7-11.7 ns, 200 singleton runs
+~1530 ns. The pre-fix figures were ~102 ns for the empty window and ~76 ns for
+one gap. The earlier 19 ns for two gaps was a single mid-range observation; the
+best-of-9 value is lower, and the table above reports the measured range.
 
 ## 2. Module split along real seams
 
@@ -696,8 +707,9 @@ SDP and RTCP each had their own bounded-buffer writer. Extracted to `wr_sb`
 (`include/wr/sb.h` / `src/base/sb.c`). The first version routed BE16/32/64
 writes through the variable-size path, which regressed RTCP RR serialization
 by roughly 4x (7.8 -> ~31 ns). The builder now keeps a direct-store fast path
-for fixed widths, and RTCP RR stays at 7.8-9.0 ns, `parse_one` ~2.2 ns,
-`rr_parse` ~3.7 ns.
+for fixed widths, and RTCP RR stays at 7.7-10.2 ns for one report block
+(16.1-16.2 ns for four), `parse_one` ~2.2 ns,
+`rr_parse` 4.1-4.6 ns for one block and 9.4-9.5 ns for four.
 
 Regression: `test_base.c::test_sb` covers decimal, IPv4, BE writes, truncation
 behavior, and zero capacity.
