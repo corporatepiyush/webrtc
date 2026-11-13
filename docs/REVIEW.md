@@ -17,6 +17,7 @@ defect below has a regression test or a fuzz target that would have caught it.
 | 7 | 28-target fuzz campaign, then optimization | 3 + 2 harness bugs |
 | 8 | Adversarial black-box audit | 8 + hardening |
 | 9 | SACK gap semantics + module split | 1 + build/coverage evidence |
+| 10 | Real-peer gap analysis (OpenSSL DTLS, burst sends) | 7, all measured |
 
 ---
 
@@ -649,6 +650,49 @@ measures 5.8 ns for 19-digit `wr_parse_u64` and 710 ns for the 1.2 KiB SDP
 parse. Benchmarks must come from the strict `-O2` build.
 
 ---
+
+# Pass 10 — real-peer gap analysis (measured)
+
+The first nine passes checked the code against its own tests. This pass checked
+it against OpenSSL's DTLS stack and against a realistic message pattern, and
+found that several "DONE" items do not survive contact with a real peer. Full
+detail and runnable probes are in `docs/GAPS.md` and `docs/probes/`.
+
+The three that matter most:
+
+1. **DTLS cannot interop with OpenSSL.** The server's first flight is a
+   `HelloVerifyRequest`; the client has no cookie exchange and ignores handshake
+   type 3, so the handshake stalls. The ClientHello also carries no extensions
+   at all, so `use_srtp`, `supported_groups`, and `signature_algorithms` are
+   missing. Measured: server logs `DTLS1 write hello verify request` and nothing
+   else.
+2. **DTLS concatenates application records.** Two records in one datagram are
+   returned as one span (`'AAAA'` + `'BBBB'` -> `'AAAABBBB'`). The upper layer
+   cannot tell where one record ends, so SCTP's CRC covers trailing bytes and
+   fails.
+3. **That concatenation loses real data.** Through the full
+   `wr_pc` -> ICE -> DTLS -> SCTP stack, one message is delivered and three
+   back-to-back messages deliver zero. This is not a corner case; it is the
+   normal case for any burst.
+
+Two SCTP bugs of the same class as earlier passes:
+
+4. `wr_sctp_input` accepts DATA on an association in `CLOSED`, with an
+   arbitrary verification tag, and delivers it to the application.
+5. `send_sack` truncates the gap list at 8 blocks; 20 disjoint received runs
+   produce `ngaps=8`, so the peer cannot learn about the other 12.
+
+And two performance cliffs:
+
+6. `wr_sctp_step` scans every queued TX entry; with 21k unacked it takes 70 ms
+   per call, and the first RTO makes every entry eligible at once.
+7. `wr_pc_step` blocks for 10 ms in `wr_io_wait` on every call, so an idle step
+   costs 11 ms (22 ms with DTLS).
+
+What this does not change: the codecs, the arena/maps/pool, and the parser
+fuzzing results are still valid. What it does change is the claim that the core
+is usable as a peer. It is not yet; the blockers are enumerated in
+`docs/GAPS.md` with the probes that demonstrate them.
 
 # Pass 9 — SACK gap semantics, module split, measured builds
 

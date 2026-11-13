@@ -17,6 +17,10 @@ matrix.
 - **Tests:** Debug, ASan/UBSan, strict `-O2`, and optional FFmpeg builds pass.
 - **Fuzzing:** 28 targets, clean in the latest parallel libFuzzer campaign
   (ASan+UBSan, ~15.05M executions).
+- **Not production-ready:** `docs/GAPS.md` records measured blockers —
+  no DTLS cookie exchange, no ClientHello extensions, DTLS record
+  concatenation, no SCTP fragmentation, no ICE STUN gathering. Each has a
+  runnable probe in `docs/probes/`.
 - **Coverage:** 77.69% of lines, 86.97% of functions, 73.30% of branches,
   61.46% of regions over the merged corpus. Handshake/auth/integration gaps
   remain and are listed in `docs/FUZZING.md`.
@@ -165,6 +169,8 @@ not installed in the authoring environment, so that path is unverified here.
 | `docs/PERFORMANCE.md` | hot-path numbers, allocation profile, build time, budgets |
 | `docs/REVIEW.md` | skeptical audit history and fixes |
 | `docs/PLAN.md` | historical design plan and milestone mapping |
+| `docs/GAPS.md` | measured real-world gaps (DTLS interop, SCTP, ICE) with probes |
+| `docs/probes/` | runnable probe sources for every claim in `docs/GAPS.md` |
 
 ## License
 
