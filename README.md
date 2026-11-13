@@ -146,6 +146,13 @@ not installed in the authoring environment, so that path is unverified here.
 - **Fuzz oracles.** ASan/UBSan (and LSan where the runtime supports it),
   allocation caps, round-trip idempotence, and state-machine assertions.
 
+## Contributing
+
+- Run `./scripts/build_all.sh` and the relevant fuzz targets before
+  opening a change; both are the local gate.
+- Benchmarks come from `build-rel/`, never from `build/`.
+- Do not hand-edit numbers in `docs/`; re-measure and paste the new result.
+
 ## Documentation
 
 | File | Contents |
@@ -161,5 +168,5 @@ not installed in the authoring environment, so that path is unverified here.
 
 ## License
 
-The code is provided as-is for the task. OpenSSL is linked for crypto
-primitives; its license applies to the linked library.
+MIT. See `LICENSE`. OpenSSL is linked for crypto primitives; its license applies
+to the linked library.
