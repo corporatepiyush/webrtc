@@ -578,11 +578,22 @@ static wr_status handle_record(wr_dtls *d, wr_span_c pkt)
             return WR_OK;
         }
         if (r.type == WR_DTLS_APPDATA) {
-            if (d->recv_len + out.len > sizeof(d->recv)) {
+            if (out.len > WR_DTLS_RECV_MAX) {
                 return WR_ERR_OVERFLOW;
             }
-            memcpy(d->recv + d->recv_len, out.ptr, out.len);
-            d->recv_len += out.len;
+            if (d->recvq_count >= WR_DTLS_RECVQ_MAX) {
+                /* Bounded queue: drop rather than corrupt framing. SCTP
+                 * recovers via retransmission; the drop is observable. */
+                d->recvq_drops++;
+                return WR_OK;
+            }
+            uint8_t tail =
+                (uint8_t)((d->recvq_head + d->recvq_count) % WR_DTLS_RECVQ_MAX);
+            if (out.len != 0u) {
+                memcpy(d->recvq[tail], out.ptr, out.len);
+            }
+            d->recvq_len[tail] = (uint16_t)out.len;
+            d->recvq_count++;
             return WR_OK;
         }
         if (r.type != WR_DTLS_HANDSHAKE) {
@@ -753,7 +764,7 @@ wr_status wr_dtls_send(wr_dtls *d, wr_span_c app)
     if (!d || !d->keys_ready || d->state != WR_DTLS_DONE) {
         return WR_ERR_STATE;
     }
-    if (app.len > sizeof(((wr_dtls *)0)->recv) - 64u) {
+    if (app.len > WR_DTLS_RECV_MAX - 64u) {
         return WR_ERR_OVERFLOW;
     }
     uint8_t rec[2048];
@@ -771,13 +782,22 @@ wr_status wr_dtls_send(wr_dtls *d, wr_span_c app)
 
 bool wr_dtls_recv(wr_dtls *d, wr_span_c *out)
 {
-    if (!d || !out || d->recv_len == 0u) {
+    if (!d || !out || d->recvq_count == 0u) {
         return false;
     }
-    out->ptr = d->recv;
-    out->len = d->recv_len;
-    d->recv_len = 0u;
+    /* One record per call: DTLS application data is a stream of records, not
+     * a byte stream. The returned span is valid until the next call. */
+    out->ptr = d->recvq[d->recvq_head];
+    out->len = d->recvq_len[d->recvq_head];
+    d->recvq_head =
+        (uint8_t)((d->recvq_head + 1u) % WR_DTLS_RECVQ_MAX);
+    d->recvq_count--;
     return true;
+}
+
+uint32_t wr_dtls_recv_drops(const wr_dtls *d)
+{
+    return d ? d->recvq_drops : 0u;
 }
 
 bool wr_dtls_ready(const wr_dtls *d)

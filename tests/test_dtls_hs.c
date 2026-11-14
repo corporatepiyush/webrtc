@@ -133,6 +133,28 @@ void test_dtls_hs(void)
     WR_TEST_EQ_U64(out.len, 3u);
     WR_TEST_EQ_U64(memcmp(out.ptr, "bad", 3), 0);
 
+    /* Two application-data records coalesced into one datagram must be
+     * delivered as two separate records, never as one concatenated span. */
+    WR_TEST_EQ_U64(wr_dtls_send(client, wr_span_c_from_str("AAAA")), WR_OK);
+    WR_TEST_EQ_U64(wr_dtls_send(client, wr_span_c_from_str("BBBB")), WR_OK);
+    uint8_t rec1[2048], rec2[2048];
+    size_t rn1 = 0u, rn2 = 0u;
+    WR_TEST_CHECK(capture_one(io_b, rec1, sizeof(rec1), &rn1));
+    WR_TEST_CHECK(capture_one(io_b, rec2, sizeof(rec2), &rn2));
+    uint8_t joined[4096];
+    memcpy(joined, rec1, rn1);
+    memcpy(joined + rn1, rec2, rn2);
+    WR_TEST_EQ_U64(wr_dtls_input(server, wr_span_c_make(joined, rn1 + rn2)),
+                   WR_OK);
+    WR_TEST_CHECK(wr_dtls_recv(server, &out));
+    WR_TEST_EQ_U64(out.len, 4u);
+    WR_TEST_EQ_U64(memcmp(out.ptr, "AAAA", 4), 0);
+    WR_TEST_CHECK(wr_dtls_recv(server, &out));
+    WR_TEST_EQ_U64(out.len, 4u);
+    WR_TEST_EQ_U64(memcmp(out.ptr, "BBBB", 4), 0);
+    WR_TEST_CHECK(!wr_dtls_recv(server, &out));
+    WR_TEST_EQ_U64(wr_dtls_recv_drops(server), 0u);
+
     wr_dtls_destroy(client);
     wr_dtls_destroy(server);
     wr_io_destroy(io_a);

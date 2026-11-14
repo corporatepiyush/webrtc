@@ -100,6 +100,7 @@ wr_status wr_dtls_step(wr_dtls *d, uint64_t now_ms);
 wr_status wr_dtls_input(wr_dtls *d, wr_span_c pkt);
 wr_status wr_dtls_send(wr_dtls *d, wr_span_c app);
 bool wr_dtls_recv(wr_dtls *d, wr_span_c *out);
+uint32_t wr_dtls_recv_drops(const wr_dtls *d);
 bool wr_dtls_ready(const wr_dtls *d);
 wr_dtls_status wr_dtls_state(const wr_dtls *d);
 

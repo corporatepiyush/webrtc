@@ -218,6 +218,17 @@ wr_status wr_io_wait(wr_io *io, uint32_t timeout_ms, bool *ready)
         if (*ready) {
             return WR_OK;
         }
+        /* Records decrypted by an earlier input are ready without new traffic
+         * on the underlying socket. */
+        wr_span_c app;
+        if (wr_dtls_recv(io->dtls_obj, &app)) {
+            size_t n = app.len < io->queue_cap ? app.len : io->queue_cap;
+            memcpy(io->queue, app.ptr, n);
+            io->queue_len = n;
+            io->queue_off = 0u;
+            *ready = true;
+            return WR_OK;
+        }
         uint8_t buf[2048];
         for (int i = 0; i < 8; ++i) {
             bool under_ready = false;
@@ -232,7 +243,6 @@ wr_status wr_io_wait(wr_io *io, uint32_t timeout_ms, bool *ready)
                 break;
             }
             (void)wr_dtls_input(io->dtls_obj, wr_span_upcast(data));
-            wr_span_c app;
             if (wr_dtls_recv(io->dtls_obj, &app)) {
                 size_t n = app.len < io->queue_cap ? app.len : io->queue_cap;
                 memcpy(io->queue, app.ptr, n);

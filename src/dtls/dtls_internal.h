@@ -9,6 +9,12 @@
 #define WR_DTLS_FLIGHT_MAX 4096u
 #define WR_DTLS_HI_MAX     4096u
 #define WR_DTLS_CERT_MAX   1536u
+/* Application-data queue: DTLS records are datagrams. Each decrypted record is
+ * queued separately and returned by one wr_dtls_recv call; records are never
+ * concatenated, because the upper layer (SCTP) parses each record as one
+ * self-delimiting packet. */
+#define WR_DTLS_RECV_MAX   2048u
+#define WR_DTLS_RECVQ_MAX  16u
 
 typedef enum {
     WAIT_NONE = 0,
@@ -75,8 +81,11 @@ struct wr_dtls {
     uint8_t peer_fp[32];
     bool have_peer_fp;
 
-    uint8_t recv[2048];
-    size_t recv_len;
+    uint8_t recvq[WR_DTLS_RECVQ_MAX][WR_DTLS_RECV_MAX];
+    uint16_t recvq_len[WR_DTLS_RECVQ_MAX];
+    uint8_t recvq_head;
+    uint8_t recvq_count;
+    uint32_t recvq_drops;
 };
 
 static inline uint32_t load_be24(const uint8_t *p)
