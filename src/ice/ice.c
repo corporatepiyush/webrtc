@@ -17,12 +17,17 @@ void wr_ice_config_defaults(wr_ice_config *cfg)
     cfg->consent_freshness = true;
     cfg->consent_interval_ms = 5000u;
     cfg->consent_timeout_ms = 15000u;
+    cfg->local_pref = 65535u;
 }
 
 wr_ice_agent *wr_ice_create(wr_arena *a, const wr_ice_config *cfg,
                             wr_rng *rng)
 {
-    if (!a) {
+    /* The RNG is mandatory: it seeds the role-conflict tie-breaker and every
+     * STUN transaction id. Without it both become predictable, and a peer (or
+     * an attacker) could forge or pre-compute the responses that nominate a
+     * candidate pair. */
+    if (!a || !rng) {
         return NULL;
     }
     wr_ice_agent *ag = (wr_ice_agent *)wr_arena_calloc(a, 1, sizeof(*ag));
@@ -48,6 +53,9 @@ wr_ice_agent *wr_ice_create(wr_arena *a, const wr_ice_config *cfg,
     if (ag->cfg.consent_timeout_ms == 0u) {
         ag->cfg.consent_timeout_ms = 15000u;
     }
+    if (ag->cfg.local_pref == 0u) {
+        ag->cfg.local_pref = 65535u;
+    }
     wr_ice_cand_vec_init(&ag->local, a);
     wr_ice_cand_vec_init(&ag->remote, a);
     wr_ice_pair_vec_init(&ag->pairs, a);
@@ -56,7 +64,7 @@ wr_ice_agent *wr_ice_create(wr_arena *a, const wr_ice_config *cfg,
         return NULL;
     }
     ag->selected = UINT32_MAX;
-    ag->tie_breaker = rng ? wr_rng_u64(rng) : 0x1234567890abcdefULL;
+    ag->tie_breaker = wr_rng_u64(rng);
     if (ag->tie_breaker == 0u) {
         ag->tie_breaker = 1u;
     }
@@ -162,8 +170,7 @@ wr_status wr_ice_step(wr_ice_agent *ag, uint64_t now_ms)
     if (!ag || !ag->started) {
         return WR_ERR_STATE;
     }
-    if (ag->state == WR_ICE_CLOSED || ag->state == WR_ICE_FAILED ||
-        ag->state == WR_ICE_COMPLETED) {
+    if (ag->state == WR_ICE_CLOSED || ag->state == WR_ICE_FAILED) {
         return WR_OK;
     }
 
@@ -215,8 +222,11 @@ wr_status wr_ice_step(wr_ice_agent *ag, uint64_t now_ms)
         }
     }
 
-    if (ag->cfg.consent_freshness && ag->state == WR_ICE_CONNECTED &&
+    if (ag->cfg.consent_freshness &&
+        (ag->state == WR_ICE_CONNECTED || ag->state == WR_ICE_COMPLETED) &&
         ag->selected != UINT32_MAX) {
+        /* RFC 7675: consent freshness must keep running after ICE concludes,
+         * otherwise a peer that goes away is never detected. */
         if (now_ms - ag->last_response_ms >= ag->cfg.consent_timeout_ms) {
             ag->state = WR_ICE_FAILED;
             return WR_OK;
@@ -267,6 +277,11 @@ void wr_ice_close(wr_ice_agent *ag)
 wr_ice_state wr_ice_get_state(const wr_ice_agent *ag)
 {
     return ag ? ag->state : WR_ICE_CLOSED;
+}
+
+wr_ice_role wr_ice_get_role(const wr_ice_agent *ag)
+{
+    return ag ? ag->cfg.role : WR_ICE_ROLE_CONTROLLED;
 }
 
 bool wr_ice_is_complete(const wr_ice_agent *ag)

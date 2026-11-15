@@ -67,10 +67,10 @@ int main(void)
         uint8_t b[2048];
         size_t n;
         if (capture(i2, b, sizeof b, &n) == 0) {
-            wr_dtls_input(s, wr_span_c_make(b, n));
+            wr_dtls_input(s, NULL, wr_span_c_make(b, n));
         }
         if (capture(i1, b, sizeof b, &n) == 0) {
-            wr_dtls_input(c, wr_span_c_make(b, n));
+            wr_dtls_input(c, NULL, wr_span_c_make(b, n));
         }
     }
     printf("handshake ready c=%d s=%d\n", wr_dtls_ready(c), wr_dtls_ready(s));
@@ -95,7 +95,7 @@ int main(void)
     printf("record1=%zu record2=%zu\n", n1, n2);
     memcpy(joined, d1, n1);
     memcpy(joined + n1, d2, n2);
-    wr_status st = wr_dtls_input(s, wr_span_c_make(joined, n1 + n2));
+    wr_status st = wr_dtls_input(s, NULL, wr_span_c_make(joined, n1 + n2));
     printf("input(joined) st=%d (%s)\n", st, wr_status_str(st));
 
     int fail = 0;

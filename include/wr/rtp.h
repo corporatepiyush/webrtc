@@ -29,6 +29,12 @@ wr_status wr_rtp_serialize(const wr_rtp_hdr *h, wr_span_c payload, char *buf,
                            size_t cap, size_t *out_len);
 size_t wr_rtp_ext_parse(wr_span_c ext, uint16_t *id, wr_span_c *data,
                         size_t max, size_t *count);
+/* Parse an RFC 8285 extension block. `two_byte` selects the 8-bit id / 8-bit
+ * length form (RFC 8285 4.3) instead of the one-byte form (4.2). The form is
+ * a property of the negotiated extension, not of the bytes, so the caller must
+ * say which one it expects. */
+size_t wr_rtp_ext_parse_form(wr_span_c ext, bool two_byte, uint16_t *id,
+                             wr_span_c *data, size_t max, size_t *count);
 
 /* ------------------------------------------------------------------------- */
 /* RTCP                                                                      */

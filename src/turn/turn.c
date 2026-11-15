@@ -26,6 +26,7 @@ struct wr_turn {
     char pass[64];
     wr_turn_status state;
     uint8_t txid[12];
+    bool key_set;
 
     uint8_t realm[128];
     size_t realm_len;
@@ -40,11 +41,25 @@ struct wr_turn {
     bool channel_bound;
     bool permission_sent;
     uint64_t refresh_at_ms;
+    uint64_t permission_at_ms;
+
+    /* Outstanding request, for retransmission and response matching. */
+    wr_stun_method pending_method;
+    bool pending_auth;
+    uint64_t pending_sent_ms;
+    uint8_t pending_retx;
+    bool pending_active;
 
     uint8_t queue[2048];
     size_t queue_len;
     size_t queue_off;
 };
+
+/* TURN permissions last 300 s by default; refresh well before expiry.
+ * (RFC 8656 7.2: CreatePermission allocations default to 300 s.) */
+#define WR_TURN_PERMISSION_LIFETIME 300u
+#define WR_TURN_RETX_BASE_MS        500u
+#define WR_TURN_MAX_RETX            5u
 
 static void long_term_key(wr_turn *t)
 {
@@ -57,9 +72,11 @@ static void long_term_key(wr_turn *t)
     unsigned int md_len = 0u;
     if (EVP_Digest(buf, (size_t)n, t->key, &md_len, EVP_md5(), NULL) == 1 &&
         md_len == 16u) {
+        t->key_set = true;
         return;
     }
     memset(t->key, 0, sizeof(t->key));
+    t->key_set = false;
 }
 
 static wr_status send_stun(wr_turn *t, uint16_t type, bool integrity,
@@ -74,7 +91,7 @@ static wr_status send_stun(wr_turn *t, uint16_t type, bool integrity,
     }
     char buf[512];
     size_t n = 0u;
-    wr_status st = integrity
+    wr_status st = integrity && t->key_set
                        ? wr_stun_append_integrity(&m, t->key, sizeof(t->key),
                                                   buf, sizeof(buf), &n)
                        : wr_stun_serialize(&m, buf, sizeof(buf), &n);
@@ -82,7 +99,20 @@ static wr_status send_stun(wr_turn *t, uint16_t type, bool integrity,
         return st;
     }
     size_t sent = 0u;
-    return wr_io_send(t->io, &t->server, wr_span_c_make(buf, n), &sent);
+    st = wr_io_send(t->io, &t->server, wr_span_c_make(buf, n), &sent);
+    if (st == WR_OK) {
+        /* Remember what is outstanding so step() can retransmit it and
+         * input() can tell a late response from a spoofed one. The timer
+         * starts on the next step, which is the first moment a clock is
+         * available. */
+        wr_stun_class cls = WR_STUN_CLASS_REQUEST;
+        wr_stun_type_decode(type, &t->pending_method, &cls);
+        t->pending_auth = integrity;
+        t->pending_active = true;
+        t->pending_sent_ms = 0u;
+        t->pending_retx = 0u;
+    }
+    return st;
 }
 
 static wr_status send_allocate(wr_turn *t, bool auth, uint64_t now_ms)
@@ -267,6 +297,7 @@ wr_status wr_turn_connect(wr_turn *t, const wr_endpoint *peer,
     t->peer = *peer;
     t->channel = channel;
     t->has_peer = true;
+    t->permission_at_ms = 0u;
     wr_status st = send_create_permission(t);
     if (st != WR_OK) {
         return st;
@@ -356,6 +387,12 @@ wr_status wr_turn_input(wr_turn *t, uint64_t now_ms, wr_span_c pkt)
     wr_stun_method method = WR_STUN_METHOD_BINDING;
     wr_stun_class cls = WR_STUN_CLASS_REQUEST;
     wr_stun_type_decode(m.type, &method, &cls);
+    /* A response is only meaningful for the request we actually sent: bind it
+     * to the outstanding transaction id. */
+    if (cls != WR_STUN_CLASS_REQUEST &&
+        memcmp(m.txid, t->txid, sizeof(t->txid)) != 0) {
+        return WR_OK;
+    }
     if (cls == WR_STUN_CLASS_ERROR) {
         const wr_stun_attr *code = wr_stun_attr_find(&m, WR_STUN_ATTR_ERROR_CODE);
         uint32_t ec = code && code->value.len >= 4u
@@ -375,6 +412,14 @@ wr_status wr_turn_input(wr_turn *t, uint64_t now_ms, wr_span_c pkt)
     if (cls != WR_STUN_CLASS_SUCCESS) {
         return WR_OK;
     }
+    /* Once long-term credentials are in play the server must protect its
+     * responses; an unauthenticated Allocate success (a relayed address) would
+     * let an off-path attacker choose our relay endpoint. */
+    if (t->key_set && !wr_stun_verify_integrity(&m, t->key, sizeof(t->key))) {
+        return WR_ERR_AUTH;
+    }
+    t->pending_active = false;
+    t->pending_retx = 0u;
     if (method == WR_STUN_METHOD_ALLOCATE) {
         handle_allocate_success(t, &m, now_ms);
         return WR_OK;
@@ -390,13 +435,63 @@ wr_status wr_turn_input(wr_turn *t, uint64_t now_ms, wr_span_c pkt)
     return WR_OK;
 }
 
+static wr_status resend_pending(wr_turn *t)
+{
+    if (!t->pending_active) {
+        return WR_OK;
+    }
+    switch (t->pending_method) {
+    case WR_STUN_METHOD_ALLOCATE:
+        return send_allocate(t, t->pending_auth, 0u);
+    case WR_STUN_METHOD_REFRESH:
+        return send_refresh(t, 0u);
+    case WR_STUN_METHOD_CREATE_PERMISSION:
+        return send_create_permission(t);
+    case WR_STUN_METHOD_CHANNEL_BIND:
+        return send_channel_bind(t);
+    case WR_STUN_METHOD_BINDING:
+    case WR_STUN_METHOD_SEND:
+    case WR_STUN_METHOD_DATA:
+    default:
+        return WR_OK;
+    }
+}
+
 wr_status wr_turn_step(wr_turn *t, uint64_t now_ms)
 {
-    if (!t || t->state != WR_TURN_ALLOCATED) {
+    if (!t || t->state == WR_TURN_NEW || t->state == WR_TURN_CLOSED ||
+        t->state == WR_TURN_FAILED) {
+        return WR_OK;
+    }
+    /* Retransmit the outstanding request if it has not been answered. */
+    if (t->pending_active && t->pending_sent_ms != 0u) {
+        uint64_t rto = WR_TURN_RETX_BASE_MS << (t->pending_retx < 3u
+                                                    ? t->pending_retx
+                                                    : 3u);
+        if (now_ms - t->pending_sent_ms >= rto) {
+            if (t->pending_retx >= WR_TURN_MAX_RETX) {
+                t->pending_active = false;
+                t->state = WR_TURN_FAILED;
+                return WR_ERR_TIMEOUT;
+            }
+            t->pending_retx++;
+            t->pending_sent_ms = now_ms;
+            return resend_pending(t);
+        }
+    } else if (t->pending_active) {
+        t->pending_sent_ms = now_ms;
+    }
+    if (t->state != WR_TURN_ALLOCATED) {
         return WR_OK;
     }
     if (now_ms >= t->refresh_at_ms) {
         return send_refresh(t, now_ms);
+    }
+    /* Permissions expire on their own schedule and are not covered by the
+     * allocation Refresh request. */
+    if (t->has_peer && t->permission_sent && now_ms >= t->permission_at_ms) {
+        t->permission_at_ms = now_ms + WR_TURN_PERMISSION_LIFETIME * 800u;
+        return send_create_permission(t);
     }
     return WR_OK;
 }

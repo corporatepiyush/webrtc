@@ -101,7 +101,7 @@ bool wr_stun_addr_decode(wr_span_c v, bool xor_addr, const uint8_t txid[12],
 wr_status wr_stun_build_binding_request(wr_stun_msg *m, wr_arena *a,
                                         uint64_t txid_hi, uint64_t txid_lo,
                                         wr_span_c username, uint64_t priority,
-                                        bool controlling,
+                                        uint64_t tie_breaker, bool controlling,
                                         bool use_candidate);
 
 /* TURN ChannelData framing. */

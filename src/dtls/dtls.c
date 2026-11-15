@@ -209,6 +209,13 @@ wr_status wr_dtls_encrypt(const wr_dtls_cipher *c, uint8_t type,
     uint8_t nonce[12];
     memcpy(nonce, c->salt, 4u);
     memcpy(nonce + 4u, p + 13u, 8u);
+    /* RFC 6347 4.1.2.1: the AEAD additional data is NOT the record header;
+     * it is epoch || sequence || type || version || length. */
+    uint8_t aad[13];
+    memcpy(aad, p + 3u, 8u); /* epoch || seq */
+    aad[8] = p[0];           /* type */
+    memcpy(aad + 9u, p + 1u, 2u);   /* version */
+    memcpy(aad + 11u, p + 11u, 2u); /* length */
     uint8_t tag[16];
     wr_status st;
     if (c->enc) {
@@ -216,7 +223,7 @@ wr_status wr_dtls_encrypt(const wr_dtls_cipher *c, uint8_t type,
         int len = 0;
         int enc_total = 0;
         if (EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, nonce) != 1 ||
-            EVP_EncryptUpdate(ctx, NULL, &len, p, 13) != 1 ||
+            EVP_EncryptUpdate(ctx, NULL, &len, aad, 13) != 1 ||
             EVP_EncryptUpdate(ctx, p + 21u, &len, plain.ptr,
                               (int)plain.len) != 1) {
             return WR_ERR_CRYPTO;
@@ -230,7 +237,7 @@ wr_status wr_dtls_encrypt(const wr_dtls_cipher *c, uint8_t type,
     } else {
         st = wr_crypto_aead_encrypt(
             wr_crypto_openssl(), c->key, 16u, nonce,
-            wr_span_c_make(p, 13u), plain, p + 21u, tag, 16u);
+            wr_span_c_make(aad, 13u), plain, p + 21u, tag, 16u);
     }
     if (st != WR_OK) {
         return st;
@@ -261,12 +268,14 @@ wr_status wr_dtls_decrypt(const wr_dtls_cipher *c, wr_span_c pkt,
     if (out->len < ct_len) {
         return WR_ERR_OVERFLOW;
     }
-    uint8_t hdr[13];
-    hdr[0] = r.type;
-    wr_store_be16(hdr + 1u, r.version);
-    wr_store_be16(hdr + 3u, r.epoch);
-    memcpy(hdr + 5u, r.seq, 6u);
-    wr_store_be16(hdr + 11u, r.length);
+    /* RFC 6347 4.1.2.1: AAD is epoch || sequence || type || version ||
+     * length, not the record header order. */
+    uint8_t aad[13];
+    wr_store_be16(aad, r.epoch);
+    memcpy(aad + 2u, r.seq, 6u);
+    aad[8] = r.type;
+    wr_store_be16(aad + 9u, r.version);
+    wr_store_be16(aad + 11u, r.length);
     if (c->dec) {
         EVP_CIPHER_CTX *ctx = (EVP_CIPHER_CTX *)c->dec;
         int len = 0;
@@ -274,7 +283,7 @@ wr_status wr_dtls_decrypt(const wr_dtls_cipher *c, wr_span_c pkt,
         uint8_t tagbuf[16];
         memcpy(tagbuf, r.body.ptr + r.body.len - 16u, 16u);
         if (EVP_DecryptInit_ex(ctx, NULL, NULL, NULL, nonce) != 1 ||
-            EVP_DecryptUpdate(ctx, NULL, &len, hdr, 13) != 1 ||
+            EVP_DecryptUpdate(ctx, NULL, &len, aad, 13) != 1 ||
             EVP_DecryptUpdate(ctx, out->ptr, &len, r.body.ptr + 8u,
                               (int)ct_len) != 1) {
             return WR_ERR_AUTH;
@@ -288,7 +297,7 @@ wr_status wr_dtls_decrypt(const wr_dtls_cipher *c, wr_span_c pkt,
     } else {
         st = wr_crypto_aead_decrypt(
             wr_crypto_openssl(), c->key, 16u, nonce,
-            wr_span_c_make(hdr, 13u),
+            wr_span_c_make(aad, 13u),
             wr_span_c_make(r.body.ptr + 8u, ct_len),
             out->ptr, r.body.ptr + r.body.len - 16u, 16u);
     }

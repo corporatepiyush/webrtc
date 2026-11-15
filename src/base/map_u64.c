@@ -2,9 +2,22 @@
 
 #include <string.h>
 
-static inline uint64_t key_hash(uint64_t key)
+/* Per-map hash seed. An unkeyed hash lets an attacker who controls the keys
+ * (SCTP TSNs, map keys derived from packet fields) precompute collisions and
+ * turn every probe into a full scan. The seed comes from the address of a
+ * static in a PIE image, which is randomised per process, so it costs nothing
+ * and is not predictable from the outside. */
+static uint64_t next_map_seed(void)
 {
-    return wr_mix64(key) | 1u;
+    static uint64_t counter;
+    uint64_t s = (uint64_t)(uintptr_t)&counter;
+    counter++;
+    return wr_mix64(s ^ (counter * UINT64_C(0x9e3779b97f4a7c15))) | 1u;
+}
+
+static inline uint64_t key_hash(const wr_u64_map *m, uint64_t key)
+{
+    return wr_mix64(key ^ m->seed) | 1u;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -22,6 +35,7 @@ static bool map_alloc(wr_u64_map *m, uint32_t cap)
     m->hash = h;
     m->key = k;
     m->val = v;
+    m->seed = next_map_seed();
     m->cap = cap;
     m->mask = cap - 1u;
     m->len = 0u;
@@ -75,7 +89,7 @@ uint32_t *wr_u64_map_find(const wr_u64_map *m, uint64_t key)
     if (!m || m->cap == 0u) {
         return NULL;
     }
-    return wr_u64_map_find_hash(m, key_hash(key), key);
+    return wr_u64_map_find_hash(m, key_hash(m, key), key);
 }
 
 static bool map_grow(wr_u64_map *m)
@@ -84,6 +98,9 @@ static bool map_grow(wr_u64_map *m)
     if (!wr_u64_map_init(&n, m->a, m->cap * 2u + 1u)) {
         return false;
     }
+    /* The stored hashes were computed with this map's seed; keep it so they
+     * remain valid after the rehash. */
+    n.seed = m->seed;
     for (uint32_t i = 0; i < m->cap; ++i) {
         if (m->hash[i] == 0u) {
             continue;
@@ -123,7 +140,7 @@ bool wr_u64_map_put_hash(wr_u64_map *m, uint64_t h, uint64_t key, uint32_t val)
 
 bool wr_u64_map_put(wr_u64_map *m, uint64_t key, uint32_t val)
 {
-    return wr_u64_map_put_hash(m, key_hash(key), key, val);
+    return wr_u64_map_put_hash(m, key_hash(m, key), key, val);
 }
 
 bool wr_u64_map_erase(wr_u64_map *m, uint64_t key)
@@ -131,7 +148,7 @@ bool wr_u64_map_erase(wr_u64_map *m, uint64_t key)
     if (!m || m->cap == 0u) {
         return false;
     }
-    uint64_t h = key_hash(key);
+    uint64_t h = key_hash(m, key);
     uint32_t i = (uint32_t)h & m->mask;
     while (m->hash[i] != 0u && !(m->hash[i] == h && m->key[i] == key)) {
         i = (i + 1u) & m->mask;

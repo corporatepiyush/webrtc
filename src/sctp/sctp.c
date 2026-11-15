@@ -269,6 +269,11 @@ WR_VEC_DEF(wr_sctp_tx_vec, wr_sctp_tx)
 WR_VEC_DEF(wr_sctp_rx_vec, wr_sctp_rx)
 WR_VEC_DEF(wr_sctp_u32_vec, uint32_t)
 
+/* RFC 4960 3.3.1: the stream sequence number is maintained independently for
+ * each stream, so the transmit side must not share one counter across all of
+ * them. */
+#define WR_SCTP_MAX_STREAMS 64u
+
 struct wr_sctp_assoc {
     wr_arena *a;
     wr_io *io;
@@ -282,10 +287,12 @@ struct wr_sctp_assoc {
     uint32_t peer_cum_tsn; /* peer's DATA cumulative ack */
     uint32_t ack_tsn;      /* our send TSNs acked by peer */
     uint32_t next_tsn;
-    uint16_t next_seq;
+    uint16_t next_ssn[WR_SCTP_MAX_STREAMS];
+    uint16_t peer_last_ssn[WR_SCTP_MAX_STREAMS];
     uint32_t my_initial_tsn;
     wr_sctp_state state;
-    uint8_t cookie[16];
+    uint8_t cookie[256];
+    uint8_t cookie_len;
     uint8_t handshake[256];
     size_t handshake_len;
     uint64_t last_handshake_ms;
@@ -373,7 +380,7 @@ void wr_sctp_start_established(wr_sctp_assoc *as, uint32_t my_vtag,
     as->peer_cum_tsn = peer_initial_tsn - 1u;
     wr_tsn_set_init(&as->rx_tsn, as->peer_cum_tsn);
     as->next_tsn = my_vtag;
-    as->next_seq = 0u;
+    memset(as->next_ssn, 0, sizeof(as->next_ssn));
     as->established = true;
     as->closed = false;
     as->state = WR_SCTP_ST_ESTABLISHED;
@@ -402,6 +409,18 @@ static wr_status send_packet(wr_sctp_assoc *as, wr_span_c chunks)
     return wr_io_send(as->io, &as->remote, wr_span_c_make(buf, n), &sent);
 }
 
+/* Advertised receive window: the negotiated TSN window minus the chunks that
+ * are stored but not yet delivered. Advertising a constant 65535 (as this
+ * layer once did) lets a peer overrun the association regardless of state. */
+static uint32_t available_rwnd(const wr_sctp_assoc *as)
+{
+    size_t live = as->rx.len - as->rx_free.len;
+    if (live >= WR_SCTP_RX_WINDOW) {
+        return 0u;
+    }
+    return (uint32_t)(WR_SCTP_RX_WINDOW - live);
+}
+
 static wr_status send_sack(wr_sctp_assoc *as, uint32_t cum_tsn)
 {
     wr_tsn_gap gaps[8];
@@ -413,8 +432,8 @@ static wr_status send_sack(wr_sctp_assoc *as, uint32_t cum_tsn)
     }
     char body[128];
     size_t blen = 0;
-    wr_status st = wr_sctp_sack_body(cum_tsn, 65535u, flat, ngaps, NULL, 0u,
-                                     body, sizeof(body), &blen);
+    wr_status st = wr_sctp_sack_body(cum_tsn, available_rwnd(as), flat, ngaps,
+                                     NULL, 0u, body, sizeof(body), &blen);
     if (st != WR_OK) {
         return st;
     }
@@ -474,23 +493,42 @@ static wr_status send_init(wr_sctp_assoc *as, uint64_t now_ms)
 
 static void handle_init(wr_sctp_assoc *as, const wr_sctp_chunk *c)
 {
-    if (as->state != WR_SCTP_ST_CLOSED || c->body.len < 16u) {
+    if (c->body.len < 16u) {
         return;
     }
-    as->peer_vtag = wr_load_be32(c->body.ptr);
+    uint32_t peer_vtag = wr_load_be32(c->body.ptr);
+    if (as->state == WR_SCTP_ST_COOKIE_ECHOED) {
+        /* A retransmitted INIT from the client we already answered: replay the
+         * stored INIT_ACK instead of ignoring it. Dropping it wedges the peer
+         * in COOKIE_ECHOED until it gives up. */
+        if (peer_vtag == as->peer_vtag && as->io && as->handshake_len != 0u) {
+            size_t sent = 0u;
+            (void)wr_io_send(as->io, &as->remote,
+                             wr_span_c_make(as->handshake, as->handshake_len),
+                             &sent);
+        }
+        return;
+    }
+    if (as->state != WR_SCTP_ST_CLOSED) {
+        return;
+    }
+    as->peer_vtag = peer_vtag;
     as->peer_initial_tsn = wr_load_be32(c->body.ptr + 12u);
     as->peer_cum_tsn = as->peer_initial_tsn - 1u;
     if (as->rng) {
         (void)wr_rng_fill(as->rng, as->cookie, sizeof(as->cookie));
     }
+    /* This stack issues a 16-byte cookie; the buffer is larger only so a peer's
+     * longer cookie can be stored. */
+    as->cookie_len = 16u;
     uint8_t body[16 + 2 + 16];
     wr_store_be32(body, as->my_vtag);
     wr_store_be32(body + 4u, 65535u);
     wr_store_be16(body + 8u, 64u);
     wr_store_be16(body + 10u, 64u);
     wr_store_be32(body + 12u, as->my_initial_tsn);
-    wr_store_be16(body + 16u, 16u);
-    memcpy(body + 18u, as->cookie, 16u);
+    wr_store_be16(body + 16u, (uint16_t)as->cookie_len);
+    memcpy(body + 18u, as->cookie, as->cookie_len);
     (void)send_handshake(as, WR_SCTP_INIT_ACK, 0u,
                          wr_span_c_make(body, sizeof(body)), 0u);
     as->state = WR_SCTP_ST_COOKIE_ECHOED;
@@ -505,22 +543,28 @@ static void handle_init_ack(wr_sctp_assoc *as, const wr_sctp_chunk *c)
     as->peer_vtag = wr_load_be32(c->body.ptr);
     as->peer_initial_tsn = wr_load_be32(c->body.ptr + 12u);
     as->peer_cum_tsn = as->peer_initial_tsn - 1u;
-    uint16_t cookie_len = wr_load_be16(c->body.ptr + 16u);
-    if (18u + cookie_len > c->body.len || cookie_len > sizeof(as->cookie)) {
+    uint16_t ck_len = wr_load_be16(c->body.ptr + 16u);
+    /* RFC 4960 3.3.10: the cookie is an opaque, variable-length blob chosen by
+     * the peer (up to 32768 bytes). This stack issues 16-byte cookies, but a
+     * peer may echo anything it was sent, so accept the full 1-octet length
+     * range rather than requiring exactly 16. */
+    if (18u + ck_len > c->body.len || ck_len == 0u ||
+        ck_len > sizeof(as->cookie)) {
         return;
     }
-    memcpy(as->cookie, c->body.ptr + 18u, cookie_len);
+    as->cookie_len = (uint8_t)ck_len;
+    memcpy(as->cookie, c->body.ptr + 18u, ck_len);
     (void)send_handshake(as, WR_SCTP_COOKIE_ECHO, 0u,
-                         wr_span_c_make(as->cookie, cookie_len), 0u);
+                         wr_span_c_make(as->cookie, as->cookie_len), 0u);
     as->state = WR_SCTP_ST_COOKIE_SENT;
     wr_tsn_set_init(&as->rx_tsn, as->peer_cum_tsn);
 }
 
 static void handle_cookie_echo(wr_sctp_assoc *as, const wr_sctp_chunk *c)
 {
-    if (as->state != WR_SCTP_ST_COOKIE_ECHOED ||
-        c->body.len != sizeof(as->cookie) ||
-        memcmp(c->body.ptr, as->cookie, sizeof(as->cookie)) != 0) {
+    if (as->state != WR_SCTP_ST_COOKIE_ECHOED || as->cookie_len == 0u ||
+        c->body.len != as->cookie_len ||
+        memcmp(c->body.ptr, as->cookie, as->cookie_len) != 0) {
         return;
     }
     (void)send_handshake(as, WR_SCTP_COOKIE_ACK, 0u,
@@ -562,7 +606,13 @@ wr_status wr_sctp_send_data(wr_sctp_assoc *as, uint16_t stream, uint32_t ppid,
     memset(&tx, 0, sizeof(tx));
     tx.tsn = as->next_tsn++;
     tx.stream = stream;
-    tx.seq = as->next_seq++;
+    if (stream < WR_SCTP_MAX_STREAMS) {
+        tx.seq = as->next_ssn[stream]++;
+    } else {
+        /* Stream ids outside the negotiated range are refused rather than
+         * silently aliasing another stream's sequence space. */
+        return WR_ERR_INVAL;
+    }
     tx.ppid = ppid;
     uint8_t *copy = (uint8_t *)wr_arena_alloc(as->a, data.len + 1u);
     if (!copy) {
@@ -623,10 +673,21 @@ static void handle_data(wr_sctp_assoc *as, wr_sctp_chunk *c, uint64_t now_ms)
     if (c->body.len < 12u) {
         return;
     }
+    /* DATA is only meaningful inside an established association. Without this
+     * check an off-path host could inject TSNs and desynchronise the receive
+     * window before (or after) the handshake, which is exactly the state
+     * confusion an attacker wants. */
+    if (as->state != WR_SCTP_ST_ESTABLISHED) {
+        return;
+    }
     uint32_t tsn = wr_load_be32(c->body.ptr);
     uint16_t stream = wr_load_be16(c->body.ptr + 4u);
     uint16_t seq = wr_load_be16(c->body.ptr + 6u);
     uint32_t ppid = wr_load_be32(c->body.ptr + 8u);
+    if (stream >= WR_SCTP_MAX_STREAMS) {
+        /* The association was negotiated for at most this many streams. */
+        return;
+    }
     wr_span_c payload = wr_span_c_sub(c->body, 12u, c->body.len - 12u);
 
     if (tsn <= as->peer_cum_tsn || wr_tsn_set_has(&as->rx_tsn, tsn)) {
@@ -637,6 +698,10 @@ static void handle_data(wr_sctp_assoc *as, wr_sctp_chunk *c, uint64_t now_ms)
         (void)send_sack(as, as->peer_cum_tsn);
         return;
     }
+    /* Track the per-stream sequence so a gap or a replay is visible. Delivery
+     * is TSN-ordered, so this is advisory, but it keeps the association honest
+     * about stream-level loss. */
+    as->peer_last_ssn[stream] = seq;
 
     uint8_t *copy = (uint8_t *)wr_arena_alloc(as->a, payload.len + 1u);
     if (!copy) {
@@ -668,7 +733,6 @@ static void handle_data(wr_sctp_assoc *as, wr_sctp_chunk *c, uint64_t now_ms)
     as->received++;
 
     deliver_ready(as);
-    (void)seq;
     (void)now_ms;
     (void)send_sack(as, as->peer_cum_tsn);
 }
@@ -679,10 +743,46 @@ static void handle_sack(wr_sctp_assoc *as, wr_sctp_chunk *c)
         return;
     }
     uint32_t cum = wr_load_be32(c->body.ptr);
+    uint32_t a_rwnd = wr_load_be32(c->body.ptr + 4u);
+    uint16_t ngaps = wr_load_be16(c->body.ptr + 8u);
+    uint16_t ndups = wr_load_be16(c->body.ptr + 10u);
+    /* Gap-ack blocks: [start, end] inclusive, relative to the cumulative TSN
+     * (RFC 4960 3.3.4). Ignoring them (as this layer once did) makes every
+     * out-of-order delivery look lost, so a reordered stream retransmits
+     * forever and never advances. */
+    size_t off = 12u;
+    uint32_t gap_start[16];
+    uint32_t gap_end[16];
+    uint32_t nblocks = 0u;
+    if ((size_t)ngaps > (c->body.len - off) / 8u) {
+        ngaps = (uint16_t)((c->body.len - off) / 8u);
+    }
+    for (uint32_t i = 0; i < ngaps && nblocks < WR_ARRAY_LEN(gap_start); ++i) {
+        gap_start[nblocks] = wr_load_be32(c->body.ptr + off);
+        gap_end[nblocks] = wr_load_be32(c->body.ptr + off + 4u);
+        off += 8u;
+        nblocks++;
+    }
+    (void)ndups; /* duplicate TSN reports carry no action for the sender */
+
     uint32_t newly = 0u;
     for (size_t i = as->tx_off; i < as->tx.len; ++i) {
-        if (!as->tx.data[i].acked && as->tx.data[i].tsn <= cum) {
-            as->tx.data[i].acked = true;
+        wr_sctp_tx *tx = &as->tx.data[i];
+        if (tx->acked) {
+            continue;
+        }
+        bool acked = tx->tsn <= cum;
+        if (!acked) {
+            for (uint32_t g = 0; g < nblocks; ++g) {
+                if (tx->tsn >= cum + gap_start[g] &&
+                    tx->tsn <= cum + gap_end[g]) {
+                    acked = true;
+                    break;
+                }
+            }
+        }
+        if (acked) {
+            tx->acked = true;
             newly++;
         }
     }
@@ -715,12 +815,115 @@ static void handle_sack(wr_sctp_assoc *as, wr_sctp_chunk *c)
         }
         as->ack_tsn = cum;
     }
+    /* The peer's receive window bounds how much may be in flight. */
+    as->rwnd = a_rwnd;
 }
 
-wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms, wr_span_c packet)
+static bool vtag_ok(const wr_sctp_assoc *as, const wr_sctp_packet *hdr,
+                    const wr_sctp_chunk *chunks, size_t n)
+{
+    /* An INIT is the only chunk that carries the *sender's* tag: a packet made
+     * up exclusively of INIT chunks is acceptable only before any state
+     * exists. Everything else must echo the tag we chose (RFC 4960 3.3.1 /
+     * 8.4.1), which is what makes off-path injection detectable. */
+    bool only_init = n > 0u;
+    for (size_t i = 0; i < n; ++i) {
+        if (chunks[i].type != WR_SCTP_INIT) {
+            only_init = false;
+            break;
+        }
+    }
+    if (only_init) {
+        return as->state == WR_SCTP_ST_CLOSED;
+    }
+    if (hdr->vtag == as->my_vtag) {
+        return true;
+    }
+    /* An ABORT may be sent with a zero verification tag (RFC 4960 3.3.7). */
+    if (hdr->vtag == 0u) {
+        for (size_t i = 0; i < n; ++i) {
+            if (chunks[i].type == WR_SCTP_ABORT) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* RFC 6525 3.3.2: a STREAM_RESET chunk carries a list of parameter types.
+ * Type 3 means "all streams". */
+#define WR_SCTP_STREAM_RESET 130u
+#define WR_SCTP_RESET_ALL_STREAMS 3u
+
+static void send_stream_reset_all(wr_sctp_assoc *as)
+{
+    uint8_t param[4];
+    wr_store_be16(param, WR_SCTP_RESET_ALL_STREAMS);
+    wr_store_be16(param + 2u, 4u);
+    char chunk[16];
+    size_t clen = 0u;
+    /* Flags bit 0 = "last chunk in the packet" (RFC 6525 3.3.2). */
+    if (wr_sctp_chunk_serialize(WR_SCTP_STREAM_RESET, 0x01u,
+                                wr_span_c_make(param, sizeof(param)), chunk,
+                                sizeof(chunk), &clen) != WR_OK) {
+        return;
+    }
+    (void)send_packet(as, wr_span_c_make(chunk, clen));
+}
+
+static void handle_stream_reset(wr_sctp_assoc *as, const wr_sctp_chunk *c)
+{
+    if (as->state != WR_SCTP_ST_ESTABLISHED) {
+        return;
+    }
+    /* Find the parameter list and look for the "all streams" marker. A peer
+     * that resets individual streams is not distinguished here: the local
+     * stream table is a single set of sequence counters, so dropping
+     * undelivered data is the conservative action either way. */
+    size_t off = 0u;
+    bool all = false;
+    while (off + 4u <= c->body.len) {
+        uint16_t ptype = wr_load_be16(c->body.ptr + off);
+        uint16_t plen = wr_load_be16(c->body.ptr + off + 2u);
+        if (plen < 4u || off + plen > c->body.len) {
+            break;
+        }
+        if (ptype == WR_SCTP_RESET_ALL_STREAMS) {
+            all = true;
+        }
+        off += plen;
+    }
+    if (!all) {
+        return;
+    }
+    /* Discard chunks that were received but never delivered. Already-ready
+     * entries are left alone: they were accepted before the reset. */
+    for (size_t i = 0; i < as->rx.len; ++i) {
+        if (as->rx.data[i].data.ptr != NULL) {
+            (void)wr_u64_map_erase(&as->rx_map, as->rx.data[i].tsn);
+            as->rx.data[i].data = wr_span_c_make(NULL, 0u);
+            if (as->rx_free.len < as->rx_free.cap) {
+                (void)wr_sctp_u32_vec_push(&as->rx_free, (uint32_t)i);
+            }
+        }
+    }
+    as->peer_cum_tsn = as->rx_tsn.cum;
+    memset(as->next_ssn, 0, sizeof(as->next_ssn));
+    memset(as->peer_last_ssn, 0, sizeof(as->peer_last_ssn));
+    (void)send_stream_reset_all(as);
+}
+
+wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms,
+                        const wr_endpoint *from, wr_span_c packet)
 {
     if (!as) {
         return WR_ERR_INVAL;
+    }
+    /* Source filtering: the association is bound to one peer. Without it any
+     * host that can reach the socket can inject chunks, and SCTP has no
+     * cryptographic protection of its own. */
+    if (from && as->remote.port != 0u && !wr_endpoint_eq(&as->remote, from)) {
+        return WR_ERR_AUTH;
     }
     wr_sctp_packet hdr;
     wr_sctp_chunk stack_chunks[WR_SCTP_INLINE_CHUNKS];
@@ -740,7 +943,10 @@ wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms, wr_span_c packet)
     } else if (st != WR_OK) {
         return st;
     }
-    if (as->state == WR_SCTP_ST_ESTABLISHED && hdr.vtag != as->my_vtag) {
+    if (chunk_count == 0u) {
+        return WR_ERR_TRUNCATED;
+    }
+    if (!vtag_ok(as, &hdr, chunks, chunk_count)) {
         return WR_ERR_AUTH;
     }
     for (size_t i = 0; i < chunk_count; ++i) {
@@ -753,6 +959,10 @@ wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms, wr_span_c packet)
             handle_sack(as, c);
             break;
         case WR_SCTP_HEARTBEAT: {
+            /* Only an established association has a peer to answer. */
+            if (as->state != WR_SCTP_ST_ESTABLISHED) {
+                break;
+            }
             char chunk[64];
             size_t clen = 0;
             (void)wr_sctp_chunk_serialize(WR_SCTP_HEARTBEAT_ACK, 0u,
@@ -773,7 +983,13 @@ wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms, wr_span_c packet)
         case WR_SCTP_COOKIE_ACK:
             handle_cookie_ack(as, c);
             break;
+        case WR_SCTP_STREAM_RESET:
+            handle_stream_reset(as, c);
+            break;
         case WR_SCTP_SHUTDOWN: {
+            if (as->state != WR_SCTP_ST_ESTABLISHED) {
+                break;
+            }
             char chunk[8];
             size_t clen = 0;
             (void)wr_sctp_chunk_serialize(WR_SCTP_SHUTDOWN_ACK, 0u,
@@ -835,6 +1051,19 @@ wr_status wr_sctp_step(wr_sctp_assoc *as, uint64_t now_ms)
             as->slow_start = true;
         }
     }
+    /* If every outstanding chunk has exhausted its retransmit budget the peer
+     * is gone. Signal failure instead of looping silently forever. */
+    bool any_live = false;
+    for (size_t i = as->tx_off; i < as->tx.len; ++i) {
+        if (!as->tx.data[i].acked && as->tx.data[i].xmit < 6u) {
+            any_live = true;
+            break;
+        }
+    }
+    if (!any_live && as->tx_off < as->tx.len) {
+        as->state = WR_SCTP_ST_FAILED;
+        as->established = false;
+    }
     return WR_OK;
 }
 
@@ -862,10 +1091,18 @@ bool wr_sctp_recv(wr_sctp_assoc *as, wr_sctp_delivery *out)
 
 void wr_sctp_close(wr_sctp_assoc *as)
 {
-    if (as) {
-        as->closed = true;
-        as->established = false;
+    if (!as) {
+        return;
     }
+    if (as->state == WR_SCTP_ST_ESTABLISHED) {
+        /* Tell the peer the streams are gone instead of just dropping them:
+         * without this its delivery queue fills with data that will never be
+         * read. */
+        send_stream_reset_all(as);
+        as->state = WR_SCTP_ST_CLOSING;
+    }
+    as->closed = true;
+    as->established = false;
 }
 
 wr_status wr_sctp_start(wr_sctp_assoc *as, uint64_t now_ms)

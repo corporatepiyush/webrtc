@@ -34,6 +34,10 @@ static void test_loopback(void)
                           wr_span_c_from_str("pB"),
                           wr_span_c_from_str("uA"),
                           wr_span_c_from_str("pA"));
+    /* This test exercises the plaintext path deliberately: without DTLS the
+     * verification tags are predictable and both peers must agree on them. */
+    wr_pc_disable_dtls(a);
+    wr_pc_disable_dtls(b);
 
     uint64_t now = 1000;
     WR_TEST_EQ_U64(wr_pc_start(a, now), WR_OK);
@@ -73,8 +77,16 @@ static void test_loopback(void)
     WR_TEST_EQ_U64(memcmp(d.data.ptr, "hello", 5), 0);
 
     WR_TEST_EQ_U64(wr_pc_send(b, wr_span_c_from_str("world")), WR_OK);
-    (void)wr_pc_step(a, now);
-    WR_TEST_CHECK(wr_pc_recv(a, &d));
+    /* wr_pc_step no longer blocks in recv: the datagram may not have arrived
+     * yet, so the caller drives steps until it is delivered. */
+    bool got2 = false;
+    for (int i = 0; i < 100 && !got2; ++i) {
+        now += 5;
+        (void)wr_pc_step(a, now);
+        (void)wr_pc_step(b, now);
+        got2 = wr_pc_recv(a, &d);
+    }
+    WR_TEST_CHECK(got2);
     WR_TEST_EQ_U64(memcmp(d.data.ptr, "world", 5), 0);
 
     wr_pc_close(a);

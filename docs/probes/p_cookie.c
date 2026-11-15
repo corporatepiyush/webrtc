@@ -36,7 +36,7 @@ int main(int argc,char**argv){
                     printf("  -> our client has NO cookie support; it will never answer.\n");
                 }
             }
-            wr_dtls_input(d,wr_span_upcast(data));
+            wr_dtls_input(d,NULL,wr_span_upcast(data));
         }
     }
     printf("final state=%d\n",wr_dtls_state(d));

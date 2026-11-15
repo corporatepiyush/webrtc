@@ -50,6 +50,9 @@ wr_status wr_io_send(wr_io *io, const wr_endpoint *dst, wr_span_c data,
                      size_t *sent);
 wr_status wr_io_recv(wr_io *io, wr_endpoint *src, wr_span buf, wr_span *out);
 wr_status wr_io_wait(wr_io *io, uint32_t timeout_ms, bool *ready);
+/* Datagrams discarded by the DTLS path because they exceeded the receive
+ * buffer (WR_ERR_OVERFLOW from recv). Non-zero means records were lost. */
+uint32_t wr_io_drops(const wr_io *io);
 void wr_io_destroy(wr_io *io);
 
 /* ------------------------------------------------------------------------- */

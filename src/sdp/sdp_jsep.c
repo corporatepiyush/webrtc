@@ -25,15 +25,19 @@ wr_status wr_sdp_ice_parse(const wr_sdp_session *s, const wr_sdp_media *m,
     }
     memset(out, 0, sizeof(*out));
     const wr_sdp_attr *a = attr_on(s, m, wr_span_c_from_str("ice-ufrag"));
-    if (a) {
-        out->present = true;
+    if (a && a->value.len > 0u) {
         out->ufrag = a->value;
+        out->has_ufrag = true;
     }
     a = attr_on(s, m, wr_span_c_from_str("ice-pwd"));
-    if (a) {
-        out->present = true;
+    if (a && a->value.len > 0u) {
         out->pwd = a->value;
+        out->has_pwd = true;
     }
+    /* `present` means "usable ICE parameters were supplied": a half-specified
+     * ufrag/pwd pair must not look like a complete one, or the caller will
+     * install a truncated credential and every check will fail to verify. */
+    out->present = out->has_ufrag && out->has_pwd;
     a = attr_on(s, m, wr_span_c_from_str("ice-options"));
     if (a) {
         out->options = a->value;
@@ -41,7 +45,6 @@ wr_status wr_sdp_ice_parse(const wr_sdp_session *s, const wr_sdp_media *m,
     a = attr_on(s, m, wr_span_c_from_str("ice-lite"));
     if (a) {
         out->ice_lite = true;
-        out->present = true;
     }
     a = attr_on(s, m, wr_span_c_from_str("end-of-candidates"));
     if (a) {

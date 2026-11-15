@@ -15,6 +15,7 @@ void test_rtp(void);
 void test_sctp(void);
 void test_dtls(void);
 void test_dtls_hs(void);
+void test_dtls_dance(void);
 void test_pc(void);
 void test_turn(void);
 void test_crypto(void);

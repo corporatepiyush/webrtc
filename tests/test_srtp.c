@@ -237,6 +237,157 @@ static void test_aes_cm_keystream(void)
     WR_TEST_EQ_U64(memcmp(out + 12, ks, 16), 0);
 }
 
+/* SRTCP AEAD_AES_128_GCM round trip, using the packet from RFC 7714 17.1. */
+static void test_srtcp_gcm_roundtrip(void)
+{
+    /* RTCP packet: length 0x000d, SSRC "Mars", PT=200 (SR), ... */
+    uint8_t pt[32];
+    static const uint8_t hex[] = {
+        0x81, 0xc8, 0x00, 0x0d, 0x4d, 0x61, 0x72, 0x73, 0x4e, 0x54,
+        0x50, 0x31, 0x4e, 0x54, 0x50, 0x32, 0x52, 0x54, 0x50, 0x20,
+        0x00, 0x00, 0x04, 0x2a, 0x00, 0x00, 0xe9, 0x30, 0x4c, 0x75,
+        0x6e, 0x61,
+    };
+    /* The RFC appends three "deadbeef" words; this packet is 32 octets. */
+    memcpy(pt, hex, sizeof(hex));
+    const size_t pt_len = sizeof(hex);
+
+    uint8_t key[16];
+    for (int i = 0; i < 16; ++i) key[i] = (uint8_t)i;
+    uint8_t salt[12];
+    for (int i = 0; i < 12; ++i) salt[i] = (uint8_t)(0xa0 + i);
+
+    wr_srtp_ctx enc;
+    WR_TEST_EQ_U64(wr_srtcp_init(&enc, WR_SRTP_AES_GCM_128, key, salt,
+                                 0x4d617273u),
+                   WR_OK);
+    uint8_t out[128];
+    WR_TEST_EQ_U64(wr_srtcp_protect(&enc, wr_span_c_make(pt, pt_len),
+                                    wr_span_make(out, sizeof(out)), 0x5d4u),
+                   WR_OK);
+    /* The ESRTCP word must be E=1 with index 0x5d4. */
+    uint32_t e = wr_load_be32(out + 8 + (pt_len - 8u));
+    WR_TEST_EQ_U64(e, (1u << 31) | 0x5d4u);
+    /* The 8-octet header stays in the clear. */
+    WR_TEST_EQ_U64(memcmp(out, pt, 8), 0);
+
+    /* Round trip through an independent context. */
+    wr_srtp_ctx dec;
+    WR_TEST_EQ_U64(wr_srtcp_init(&dec, WR_SRTP_AES_GCM_128, key, salt,
+                                 0x4d617273u),
+                   WR_OK);
+    uint8_t back[128];
+    uint32_t idx = 0u;
+    WR_TEST_EQ_U64(wr_srtcp_unprotect(&dec, wr_span_c_make(out, 8u + (pt_len - 8u) + 4u + 16u),
+                                      wr_span_make(back, sizeof(back)), &idx),
+                   WR_OK);
+    WR_TEST_EQ_U64(idx, 0x5d4u);
+    WR_TEST_EQ_U64(memcmp(back, pt, pt_len), 0);
+    /* Replay of the same index must be rejected. */
+    WR_TEST_EQ_U64(wr_srtcp_unprotect(&dec, wr_span_c_make(out, 8u + (pt_len - 8u) + 4u + 16u),
+                                      wr_span_make(back, sizeof(back)), &idx),
+                   WR_ERR_AUTH);
+}
+
+/* AES-CM SRTCP uses labels 3/4/5, so its key material must differ from the
+ * SRTP context derived from the same master key. */
+static void test_srtcp_key_labels(void)
+{
+    uint8_t key[16];
+    uint8_t salt[14];
+    for (int i = 0; i < 16; ++i) key[i] = (uint8_t)(0x30 + i);
+    for (int i = 0; i < 14; ++i) salt[i] = (uint8_t)(0x60 + i);
+
+    wr_srtp_ctx s;
+    wr_srtp_ctx c;
+    WR_TEST_EQ_U64(wr_srtp_init(&s, WR_SRTP_AES_CM_128_HMAC_SHA1_80, key,
+                                salt, 0x11223344u),
+                   WR_OK);
+    WR_TEST_EQ_U64(wr_srtcp_init(&c, WR_SRTP_AES_CM_128_HMAC_SHA1_80, key,
+                                 salt, 0x11223344u),
+                   WR_OK);
+    WR_TEST_EQ_U64(memcmp(s.key, c.key, 16) != 0, 1);
+    WR_TEST_EQ_U64(memcmp(s.auth, c.auth, 20) != 0, 1);
+    WR_TEST_EQ_U64(memcmp(s.salt, c.salt, 14) != 0, 1);
+
+    /* The SRTCP index is 31 bits: the E flag must not leak into it. */
+    uint8_t rtcp[32];
+    memset(rtcp, 0x11, sizeof(rtcp));
+    rtcp[0] = 0x81;
+    rtcp[1] = 0xc8;
+    uint8_t out[128];
+    WR_TEST_EQ_U64(wr_srtcp_protect(&c, wr_span_c_make(rtcp, sizeof(rtcp)),
+                                    wr_span_make(out, sizeof(out)),
+                                    UINT32_C(0x7fffffff)),
+                   WR_OK);
+    uint32_t idx = 0u;
+    uint8_t back[128];
+    WR_TEST_EQ_U64(wr_srtcp_unprotect(&c, wr_span_c_make(out, sizeof(rtcp) + 4u + 10u),
+                                      wr_span_make(back, sizeof(back)), &idx),
+                   WR_OK);
+    WR_TEST_EQ_U64(idx, UINT32_C(0x7fffffff));
+}
+
+/* AES-256 profiles (RFC 6188 AES_256_CM_HMAC_SHA1_80 and RFC 7714
+ * AEAD_AES_256_GCM) derive a 32-octet session key. The master key supplied to
+ * this API is 16 octets; the KDF expands it to 32 by running the AES-CM key
+ * derivation with a 32-octet output, which is exactly what the 256-bit
+ * profiles specify. */
+static void test_aes_256(void)
+{
+    uint8_t key[16];
+    uint8_t salt[14];
+    for (int i = 0; i < 16; ++i) key[i] = (uint8_t)(0x40 + i);
+    for (int i = 0; i < 14; ++i) salt[i] = (uint8_t)(0x70 + i);
+
+    wr_srtp_ctx c;
+    WR_TEST_EQ_U64(wr_srtp_init(&c, WR_SRTP_AES_CM_256_HMAC_SHA1_80, key,
+                                salt, 0x22334455u),
+                   WR_OK);
+    WR_TEST_EQ_U64(c.tag_len, 10);
+
+    /* The KDF is a keystream: the first 16 octets of a 32-octet derivation
+     * are identical to a 16-octet one, so compare the ciphertext instead. */
+    wr_srtp_ctx c128;
+    WR_TEST_EQ_U64(wr_srtp_init(&c128, WR_SRTP_AES_CM_128_HMAC_SHA1_80, key,
+                                salt, 0x22334455u),
+                   WR_OK);
+
+    uint8_t rtp[20];
+    size_t rtp_len = 0u;
+    make_rtp(rtp, 1000, 0x22334455u, "aes256", &rtp_len);
+    uint8_t out[64];
+    WR_TEST_EQ_U64(wr_srtp_protect(&c, wr_span_c_make(rtp, rtp_len),
+                                   wr_span_make(out, sizeof(out))), WR_OK);
+    uint8_t out128[64];
+    WR_TEST_EQ_U64(wr_srtp_protect(&c128, wr_span_c_make(rtp, rtp_len),
+                                   wr_span_make(out128, sizeof(out128))), WR_OK);
+    WR_TEST_EQ_U64(memcmp(out, out128, rtp_len) != 0, 1);
+
+    uint8_t back[64];
+    WR_TEST_EQ_U64(wr_srtp_unprotect(&c,
+                                     wr_span_c_make(out, rtp_len + 10u),
+                                     wr_span_make(back, sizeof(back))),
+                   WR_OK);
+    WR_TEST_EQ_U64(memcmp(back, rtp, rtp_len), 0);
+
+    /* GCM-256 round trip. */
+    wr_srtp_ctx g;
+    WR_TEST_EQ_U64(wr_srtp_init(&g, WR_SRTP_AES_GCM_256, key, salt,
+                                0x22334455u),
+                   WR_OK);
+    WR_TEST_EQ_U64(g.tag_len, 16);
+    uint8_t gout[64];
+    WR_TEST_EQ_U64(wr_srtp_protect(&g, wr_span_c_make(rtp, rtp_len),
+                                   wr_span_make(gout, sizeof(gout))), WR_OK);
+    uint8_t gback[64];
+    WR_TEST_EQ_U64(wr_srtp_unprotect(&g,
+                                     wr_span_c_make(gout, rtp_len + 16u),
+                                     wr_span_make(gback, sizeof(gback))),
+                   WR_OK);
+    WR_TEST_EQ_U64(memcmp(gback, rtp, rtp_len), 0);
+}
+
 void test_srtp(void)
 {
     test_aes_cm();
@@ -245,4 +396,7 @@ void test_srtp(void)
     test_kdf_vector();
     test_gcm_vector();
     test_aes_cm_keystream();
+    test_srtcp_key_labels();
+    test_srtcp_gcm_roundtrip();
+    test_aes_256();
 }

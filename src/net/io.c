@@ -5,9 +5,17 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <netinet/in.h>
+
+/* Datagram size used for the DTLS receive path. DTLS records carried by this
+ * stack are at most WR_DTLS_RECV_MAX bytes; a larger datagram is dropped with
+ * WR_ERR_OVERFLOW rather than silently truncated (a truncated record fails to
+ * parse and the loss would be invisible). */
+#define WR_IO_DATAGRAM_MAX 2048u
 
 struct wr_io {
     int fd;
@@ -19,6 +27,7 @@ struct wr_io {
     size_t queue_len;
     size_t queue_off;
     size_t queue_cap;
+    uint32_t drops; /* datagrams discarded for being too large */
 };
 
 static int make_nonblocking(int fd)
@@ -164,6 +173,42 @@ wr_status wr_io_send(wr_io *io, const wr_endpoint *dst, wr_span_c data,
     return WR_OK;
 }
 
+/* Receive one datagram. A datagram larger than `buf` is discarded as a whole
+ * and reported as WR_ERR_OVERFLOW: MSG_TRUNC tells us the datagram did not
+ * fit, and the kernel has already dropped the remainder, so the socket is left
+ * clean instead of delivering a truncated record to the parser. */
+static wr_status recv_datagram(int fd, wr_span buf, wr_endpoint *src,
+                               size_t *out_len)
+{
+    struct sockaddr_storage ss;
+    struct iovec iov;
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    iov.iov_base = buf.ptr;
+    iov.iov_len = buf.len;
+    mh.msg_name = &ss;
+    mh.msg_namelen = sizeof(ss);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    ssize_t n = recvmsg(fd, &mh, 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return WR_ERR_AGAIN;
+        }
+        return WR_ERR_IO;
+    }
+    if ((mh.msg_flags & MSG_TRUNC) != 0) {
+        return WR_ERR_OVERFLOW;
+    }
+    if (src && mh.msg_namelen != 0u) {
+        (void)wr_endpoint_from_sockaddr((struct sockaddr *)&ss, src);
+    }
+    if (out_len) {
+        *out_len = (size_t)n;
+    }
+    return WR_OK;
+}
+
 wr_status wr_io_recv(wr_io *io, wr_endpoint *src, wr_span buf, wr_span *out)
 {
     if (!io || (!buf.ptr && buf.len != 0u)) {
@@ -174,7 +219,12 @@ wr_status wr_io_recv(wr_io *io, wr_endpoint *src, wr_span buf, wr_span *out)
             return WR_ERR_AGAIN;
         }
         size_t avail = io->queue_len - io->queue_off;
-        size_t n = avail < buf.len ? avail : buf.len;
+        /* A DTLS record is a datagram: truncating it would hand the caller a
+         * silently corrupted SCTP packet. Refuse instead. */
+        if (avail > buf.len) {
+            return WR_ERR_OVERFLOW;
+        }
+        size_t n = avail;
         memcpy(buf.ptr, io->queue + io->queue_off, n);
         io->queue_off += n;
         if (io->queue_off == io->queue_len) {
@@ -188,22 +238,14 @@ wr_status wr_io_recv(wr_io *io, wr_endpoint *src, wr_span buf, wr_span *out)
         (void)src; /* DTLS is point-to-point; the source is implicit. */
         return WR_OK;
     }
-    struct sockaddr_storage ss;
-    socklen_t sl = sizeof(ss);
-    ssize_t n = recvfrom(io->fd, buf.ptr, buf.len, 0,
-                         (struct sockaddr *)&ss, &sl);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return WR_ERR_AGAIN;
-        }
-        return WR_ERR_IO;
+    size_t n = 0u;
+    wr_status st = recv_datagram(io->fd, buf, src, &n);
+    if (st != WR_OK) {
+        return st;
     }
     if (out) {
         out->ptr = buf.ptr;
-        out->len = (size_t)n;
-    }
-    if (src) {
-        (void)wr_endpoint_from_sockaddr((struct sockaddr *)&ss, src);
+        out->len = n;
     }
     return WR_OK;
 }
@@ -229,7 +271,7 @@ wr_status wr_io_wait(wr_io *io, uint32_t timeout_ms, bool *ready)
             *ready = true;
             return WR_OK;
         }
-        uint8_t buf[2048];
+        uint8_t buf[WR_IO_DATAGRAM_MAX];
         for (int i = 0; i < 8; ++i) {
             bool under_ready = false;
             if (wr_io_wait(io->under, i == 0 ? timeout_ms : 0u,
@@ -238,11 +280,23 @@ wr_status wr_io_wait(wr_io *io, uint32_t timeout_ms, bool *ready)
             }
             wr_endpoint from;
             wr_span data;
-            if (wr_io_recv(io->under, &from, wr_span_make(buf, sizeof(buf)),
-                           &data) != WR_OK) {
+            wr_status rst =
+                wr_io_recv(io->under, &from, wr_span_make(buf, sizeof(buf)),
+                           &data);
+            if (rst == WR_ERR_AGAIN) {
                 break;
             }
-            (void)wr_dtls_input(io->dtls_obj, wr_span_upcast(data));
+            if (rst == WR_ERR_OVERFLOW) {
+                /* Datagram larger than any record this stack accepts: the
+                 * kernel discarded it. Count it so the loss is observable
+                 * instead of looking like a silent timeout. */
+                io->drops++;
+                continue;
+            }
+            if (rst != WR_OK) {
+                break;
+            }
+            (void)wr_dtls_input(io->dtls_obj, &from, wr_span_upcast(data));
             if (wr_dtls_recv(io->dtls_obj, &app)) {
                 size_t n = app.len < io->queue_cap ? app.len : io->queue_cap;
                 memcpy(io->queue, app.ptr, n);
@@ -268,6 +322,11 @@ wr_status wr_io_wait(wr_io *io, uint32_t timeout_ms, bool *ready)
     }
     *ready = rc > 0 && (pfd.revents & POLLIN) != 0;
     return WR_OK;
+}
+
+uint32_t wr_io_drops(const wr_io *io)
+{
+    return io ? io->drops : 0u;
 }
 
 void wr_io_destroy(wr_io *io)

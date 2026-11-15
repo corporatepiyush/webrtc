@@ -67,11 +67,24 @@ wr_status wr_rtp_serialize(const wr_rtp_hdr *h, wr_span_c payload, char *buf,
     if (!h || !buf || !out_len) {
         return WR_ERR_INVAL;
     }
-    if (h->cc != 0u || h->ext || h->padding) {
-        /* CSRC lists, header extensions, and padding are not modelled. */
+    if (h->cc != 0u || h->padding) {
+        /* CSRC lists and padding are not modelled: the header struct carries
+         * neither a CSRC list nor a pad length. */
         return WR_ERR_UNSUPPORTED;
     }
-    size_t hl = wr_rtp_header_len(h->cc, h->ext, 0u);
+    uint16_t ext_words = 0u;
+    if (h->ext) {
+        /* Header extensions use the one-byte profile 0xBEDE; the body must be a
+         * whole number of 32-bit words. */
+        if (h->ext_raw.len % 4u != 0u) {
+            return WR_ERR_INVAL;
+        }
+        ext_words = (uint16_t)(h->ext_raw.len / 4u);
+        if ((size_t)ext_words != h->ext_raw.len / 4u) {
+            return WR_ERR_OVERFLOW;
+        }
+    }
+    size_t hl = wr_rtp_header_len(h->cc, h->ext, ext_words);
     if (payload.len > SIZE_MAX - hl) {
         return WR_ERR_OVERFLOW;
     }
@@ -86,6 +99,16 @@ wr_status wr_rtp_serialize(const wr_rtp_hdr *h, wr_span_c payload, char *buf,
     wr_store_be16(p + 2u, h->seq);
     wr_store_be32(p + 4u, h->timestamp);
     wr_store_be32(p + 8u, h->ssrc);
+    size_t off = 12u;
+    if (h->ext) {
+        wr_store_be16(p + off, UINT16_C(0xbede));
+        wr_store_be16(p + off + 2u, ext_words);
+        off += 4u;
+        if (h->ext_raw.len) {
+            memcpy(p + off, h->ext_raw.ptr, h->ext_raw.len);
+            off += h->ext_raw.len;
+        }
+    }
     if (payload.len) {
         memcpy(p + hl, payload.ptr, payload.len);
     }
@@ -96,12 +119,31 @@ wr_status wr_rtp_serialize(const wr_rtp_hdr *h, wr_span_c payload, char *buf,
 size_t wr_rtp_ext_parse(wr_span_c ext, uint16_t *id, wr_span_c *data,
                         size_t max, size_t *count)
 {
+    return wr_rtp_ext_parse_form(ext, false, id, data, max, count);
+}
+
+size_t wr_rtp_ext_parse_form(wr_span_c ext, bool two_byte, uint16_t *id,
+                             wr_span_c *data, size_t max, size_t *count)
+{
     size_t n = 0u;
     size_t off = 0u;
     while (off < ext.len && n < max) {
-        uint8_t b = ext.ptr[off++];
-        uint16_t eid = (uint16_t)(b >> 4);
-        size_t len = (size_t)(b & 0x0fu) + 1u;
+        uint16_t eid;
+        size_t len;
+        if (two_byte) {
+            /* RFC 8285 4.3: 8-bit id, 8-bit length, no padding. */
+            if (off + 2u > ext.len) {
+                break;
+            }
+            eid = ext.ptr[off];
+            len = ext.ptr[off + 1u];
+            off += 2u;
+        } else {
+            /* RFC 8285 4.2: 4-bit id, 4-bit (length - 1). */
+            uint8_t b = ext.ptr[off++];
+            eid = (uint16_t)(b >> 4);
+            len = (size_t)(b & 0x0fu) + 1u;
+        }
         if (eid == 0u || eid == 15u) {
             break;
         }

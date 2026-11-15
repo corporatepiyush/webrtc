@@ -16,17 +16,98 @@ static uint32_t type_pref(wr_ice_cand_type t)
     }
 }
 
-static uint64_t candidate_priority(wr_ice_cand_type t, uint16_t component)
+/* RFC 8445 4.1.2.1: priority = 2^24 * type_pref + 2^8 * local_pref +
+ * (256 - component). local_pref is an agent-chosen value that ranks local
+ * interfaces; without interface information it defaults to the maximum so it
+ * never skews the type/component ordering. */
+static uint64_t candidate_priority(wr_ice_cand_type t, uint16_t component,
+                                   uint16_t local_pref)
 {
-    uint32_t p = (type_pref(t) << 24) | (256u - (uint32_t)(component & 0xffu));
+    uint32_t p = ((uint32_t)type_pref(t) << 24) |
+                 ((uint32_t)local_pref << 8) |
+                 (256u - (uint32_t)(component & 0xffu));
     return (uint64_t)p;
 }
 
+/* RFC 8445 6.1.2.3: G is the controlling agent's candidate, D the controlled
+ * one. The controlling agent is the one whose role decides the ordering, so
+ * the caller must pass (controlling, controlled) accordingly. */
 static uint64_t pair_priority(uint64_t g, uint64_t d)
 {
     uint64_t mn = g < d ? g : d;
     uint64_t mx = g < d ? d : g;
     return (mn << 32) | (mx << 1) | (g > d ? 1u : 0u);
+}
+
+static uint64_t pair_priority_for(const wr_ice_agent *ag, size_t local,
+                                  size_t remote)
+{
+    uint64_t lp = ag->local.data[local].priority;
+    uint64_t rp = ag->remote.data[remote].priority;
+    return ag->cfg.role == WR_ICE_ROLE_CONTROLLING ? pair_priority(lp, rp)
+                                                   : pair_priority(rp, lp);
+}
+
+/* Insertion sort, descending pair priority. */
+static void sort_pairs(wr_ice_agent *ag)
+{
+    for (size_t i = ag->pairs.len; i > 1u; --i) {
+        if (ag->pairs.data[i - 1u].priority > ag->pairs.data[i - 2u].priority) {
+            wr_ice_pair t = ag->pairs.data[i - 1u];
+            ag->pairs.data[i - 1u] = ag->pairs.data[i - 2u];
+            ag->pairs.data[i - 2u] = t;
+        } else {
+            break;
+        }
+    }
+}
+
+void wr_ice_recompute_pair_priorities(wr_ice_agent *ag)
+{
+    if (!ag || ag->pairs.len == 0u) {
+        return;
+    }
+    for (size_t i = 0; i < ag->pairs.len; ++i) {
+        wr_ice_pair *p = &ag->pairs.data[i];
+        if (p->local < ag->local.len && p->remote < ag->remote.len) {
+            p->priority = pair_priority_for(ag, p->local, p->remote);
+        }
+    }
+    /* Sort pairs and remember the permutation: in-flight checks refer to pairs
+     * by index, so reordering without remapping them would match responses to
+     * the wrong pair. */
+    uint32_t *order = (uint32_t *)wr_arena_alloc_array(
+        ag->a, ag->pairs.len, sizeof(uint32_t));
+    uint32_t *new_pos = (uint32_t *)wr_arena_alloc_array(
+        ag->a, ag->pairs.len, sizeof(uint32_t));
+    if (!order || !new_pos) {
+        return; /* cannot reorder safely: leave the order as it is */
+    }
+    for (size_t i = 0; i < ag->pairs.len; ++i) {
+        order[i] = (uint32_t)i;
+    }
+    /* Insertion sort, descending priority, carrying the original indices. */
+    for (size_t i = 1u; i < ag->pairs.len; ++i) {
+        wr_ice_pair key = ag->pairs.data[i];
+        uint32_t key_order = order[i];
+        size_t j = i;
+        while (j > 0u && ag->pairs.data[j - 1u].priority < key.priority) {
+            ag->pairs.data[j] = ag->pairs.data[j - 1u];
+            order[j] = order[j - 1u];
+            j--;
+        }
+        ag->pairs.data[j] = key;
+        order[j] = key_order;
+    }
+    for (size_t i = 0; i < ag->pairs.len; ++i) {
+        new_pos[order[i]] = (uint32_t)i;
+    }
+    for (size_t i = 0; i < ag->checks.len; ++i) {
+        uint32_t old = ag->checks.data[i].pair;
+        if (old < ag->pairs.len) {
+            ag->checks.data[i].pair = new_pos[old];
+        }
+    }
 }
 
 static uint32_t foundation_for(const wr_ice_cand *c)
@@ -50,7 +131,7 @@ uint32_t wr_ice_add_local_candidate(wr_ice_agent *ag, wr_endpoint addr,
     c.addr = addr;
     c.component = component ? component : ag->cfg.component;
     c.type = type;
-    c.priority = candidate_priority(type, (uint16_t)c.component);
+    c.priority = candidate_priority(type, (uint16_t)c.component, ag->cfg.local_pref);
     c.local = true;
     c.id = (uint32_t)ag->local.len;
     c.foundation = foundation_for(&c);
@@ -78,7 +159,7 @@ uint32_t wr_ice_add_remote_candidate(wr_ice_agent *ag, wr_endpoint addr,
     c.addr = addr;
     c.component = component ? component : ag->cfg.component;
     c.type = type;
-    c.priority = candidate_priority(type, (uint16_t)c.component);
+    c.priority = candidate_priority(type, (uint16_t)c.component, ag->cfg.local_pref);
     c.local = false;
     c.id = (uint32_t)ag->remote.len;
     c.foundation = foundation_for(&c);
@@ -117,21 +198,12 @@ bool wr_ice_add_pair(wr_ice_agent *ag, uint32_t local, uint32_t remote)
     p.local = (uint16_t)local;
     p.remote = (uint16_t)remote;
     p.state = WR_ICE_PAIR_WAITING;
-    p.priority = pair_priority(ag->local.data[local].priority,
-                               ag->remote.data[remote].priority);
+    p.priority = pair_priority_for(ag, local, remote);
     if (!wr_ice_pair_vec_push(&ag->pairs, p)) {
         return false;
     }
     /* Insertion sort by descending priority. */
-    for (size_t i = ag->pairs.len; i > 1u; --i) {
-        if (ag->pairs.data[i - 1u].priority > ag->pairs.data[i - 2u].priority) {
-            wr_ice_pair t = ag->pairs.data[i - 1u];
-            ag->pairs.data[i - 1u] = ag->pairs.data[i - 2u];
-            ag->pairs.data[i - 2u] = t;
-        } else {
-            break;
-        }
-    }
+    sort_pairs(ag);
     return true;
 }
 
@@ -168,5 +240,12 @@ void wr_ice_restart(wr_ice_agent *ag, wr_span_c ufrag, wr_span_c pwd)
     ag->last_consent_ms = 0u;
     ag->pairs.len = 0u;
     ag->checks.len = 0u;
+    /* The peer's candidate list belongs to the previous ICE generation: a
+     * restart is signalled with new credentials, and stale remote candidates
+     * would otherwise be paired and checked against the new ufrag. */
+    ag->remote.len = 0u;
+    ag->checks_sent = 0u;
+    ag->responses = 0u;
+    ag->failures = 0u;
     wr_ice_set_local_credentials(ag, ufrag, pwd);
 }

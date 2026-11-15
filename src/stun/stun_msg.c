@@ -189,7 +189,8 @@ void wr_stun_msg_init(wr_stun_msg *m, wr_arena *a, uint16_t type,
 wr_status wr_stun_build_binding_request(wr_stun_msg *m, wr_arena *a,
                                         uint64_t txid_hi, uint64_t txid_lo,
                                         wr_span_c username, uint64_t priority,
-                                        bool controlling, bool use_candidate)
+                                        uint64_t tie_breaker, bool controlling,
+                                        bool use_candidate)
 {
     uint8_t txid[12];
     wr_store_be64(txid, txid_hi);
@@ -227,7 +228,14 @@ wr_status wr_stun_build_binding_request(wr_stun_msg *m, wr_arena *a,
     if (!tie) {
         return WR_ERR_NOMEM;
     }
-    wr_store_be64(tie, controlling ? (txid_lo | 1u) : txid_lo);
+    /* RFC 8445 7.1.3: the tie-breaker is an independent 64-bit random value
+     * chosen by the agent, not a derivative of the transaction id. The caller
+     * must supply one (zero is rejected because it is a valid but constant
+     * value, which would make every agent tie with every other). */
+    if (tie_breaker == 0u) {
+        return WR_ERR_INVAL;
+    }
+    wr_store_be64(tie, tie_breaker);
     if (!wr_stun_attr_add(m, controlling ? WR_STUN_ATTR_ICE_CONTROLLING
                                          : WR_STUN_ATTR_ICE_CONTROLLED,
                           wr_span_c_make(tie, 8))) {

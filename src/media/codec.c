@@ -178,7 +178,12 @@ wr_status wr_media_enc_push(wr_media_enc *e, wr_span_c raw_yuv, uint64_t pts_ms,
         return WR_ERR_INVAL;
     }
 
-    e->frame->pts = e->pts++;
+    /* Honour the caller's timestamp: the encoder time base is 1/90000 for
+     * video, so convert milliseconds rather than using a synthetic counter
+     * that discards the caller's clock. */
+    e->frame->pts = (int64_t)((pts_ms * (uint64_t)e->ctx->time_base.den) /
+                              (uint64_t)e->ctx->time_base.num / 1000u);
+    e->pts++;
     /* av_frame_get_buffer allocated the planes; make them writable, then
      * copy the packed YUV420p input into them. */
     if (av_frame_make_writable(e->frame) < 0) {
@@ -203,7 +208,6 @@ wr_status wr_media_enc_push(wr_media_enc *e, wr_span_c raw_yuv, uint64_t pts_ms,
         return WR_ERR_CRYPTO;
     }
     drain_packets(e, out, max, count);
-    (void)pts_ms;
     return WR_OK;
 }
 
@@ -327,7 +331,15 @@ wr_status wr_media_dec_push(wr_media_dec *d, wr_span_c bitstream,
         out->width = d->frame->width;
         out->height = d->frame->height;
         out->data = d->frame->data[0];
+        out->data_u = d->frame->data[1];
+        out->data_v = d->frame->data[2];
+        out->linesize = (size_t)d->frame->linesize[0];
         out->len = (size_t)d->frame->height * (size_t)d->frame->linesize[0];
+        if (d->frame->pts != AV_NOPTS_VALUE && d->frame->time_base.den != 0u) {
+            out->pts_ms = (uint64_t)((int64_t)d->frame->pts *
+                                     (int64_t)d->frame->time_base.num * 1000 /
+                                     (int64_t)d->frame->time_base.den);
+        }
         out->sample_rate = d->frame->sample_rate;
         out->channels = d->frame->ch_layout.nb_channels;
         out->nb_samples = d->frame->nb_samples;

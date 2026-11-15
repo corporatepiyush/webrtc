@@ -147,8 +147,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     (void)wr_stun_build_binding_request(
         &req, a, wr_fuzz_stream_next(&fs), wr_fuzz_stream_next(&fs),
         wr_span_c_make(data, size < 32u ? size : 32u),
-        wr_fuzz_stream_next(&fs), wr_fuzz_stream_bool(&fs),
-        wr_fuzz_stream_bool(&fs));
+        wr_fuzz_stream_next(&fs), wr_fuzz_stream_next(&fs),
+        wr_fuzz_stream_bool(&fs), wr_fuzz_stream_bool(&fs));
     /* Serialize after the builder returned: attribute values must not point
      * into the builder's dead stack frame. */
     char reqbuf[1024];

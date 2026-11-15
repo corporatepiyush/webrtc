@@ -23,10 +23,10 @@ static int pump(wr_sctp_assoc *dst, wr_io *src, uint64_t now,
         if (choice == 0u) {
             continue; /* drop */
         }
-        (void)wr_sctp_input(dst, now, wr_span_upcast(data));
+        (void)wr_sctp_input(dst, now, &from, wr_span_upcast(data));
         delivered++;
         if (choice == 1u) {
-            (void)wr_sctp_input(dst, now, wr_span_upcast(data)); /* dup */
+            (void)wr_sctp_input(dst, now, &from, wr_span_upcast(data)); /* dup */
         }
     }
     return delivered;
@@ -115,7 +115,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             for (size_t k = 0; k < n; ++k) {
                 junk[k] = wr_fuzz_stream_u8(&fs);
             }
-            (void)wr_sctp_input(a1, now, wr_span_c_make(junk, n));
+            (void)wr_sctp_input(a1, now, NULL, wr_span_c_make(junk, n));
         }
         if (wr_fuzz_stream_below(&fs, 16u) == 0u) {
             wr_sctp_delivery d;

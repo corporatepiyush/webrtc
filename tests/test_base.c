@@ -105,6 +105,28 @@ static void test_arena(void)
     WR_TEST_CHECK(big == NULL); /* budget */
     wr_arena_reset(a);
     WR_TEST_EQ_U64(wr_arena_used(a), 0);
+
+    /* Mark/release must not assume malloc hands back increasing addresses.
+     * Force several chunks, take a mark in an older chunk, then allocate more
+     * (which may recycle a freed address below the mark) and release: the
+     * chunk holding the mark must survive with its own `used` restored, and
+     * the accounting must return to the marked totals. */
+    wr_arena *b = wr_arena_create(1u << 20u);
+    void *first = wr_arena_alloc(b, 60000);
+    WR_TEST_CHECK(first != NULL);
+    wr_arena_mark mk = wr_arena_mark_save(b);
+    void *second = wr_arena_alloc(b, 60000);
+    WR_TEST_CHECK(second != NULL);
+    size_t used_after_second = wr_arena_used(b);
+    wr_arena_mark_release(b, mk);
+    WR_TEST_EQ_U64(wr_arena_used(b), 60000u);
+    WR_TEST_CHECK(wr_arena_used(b) < used_after_second);
+    /* The mark's chunk is still the head and still bump-allocates. */
+    uint8_t *after = (uint8_t *)wr_arena_alloc(b, 1000);
+    WR_TEST_CHECK(after != NULL);
+    WR_TEST_CHECK(after != first);
+    wr_arena_destroy(b);
+
     wr_arena_destroy(a);
 }
 

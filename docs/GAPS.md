@@ -6,6 +6,35 @@ Date: 2026-11-13. Machine: Apple M-series, Homebrew clang `-O2`,
 Everything below was reproduced by running code, not by reading source. The
 probe sources are kept with this note so each claim can be re-run.
 
+## Status after the audit fixes (2026-11-15)
+
+A full audit pass fixed the items below. The analysis is kept as written — it is
+the record of what the probes measured — with the current state added per item.
+
+| Gap | State now |
+|---|---|
+| 1. No cookie exchange | **Fixed** (working tree): HVR exchange on both sides, cookie bound to peer endpoint + ClientHello random. `WR_TR_MODE`/`WR_DUMP` experiment hooks removed. |
+| 2. ClientHello without extensions | **Fixed** earlier (HEAD): use_srtp, supported_groups, signature_algorithms, EMS, point_formats. |
+| 3. Concatenated application records | **Fixed** (HEAD 8a7c0932): one record per `wr_dtls_recv`. |
+| 4. Back-to-back messages lost | **Fixed** (HEAD) with (3). |
+| 5. DATA accepted on unestablished association | **Fixed**: `handle_data` requires ESTABLISHED; verification tag validated in every state, not just ESTABLISHED; packets from a source other than the association's peer are dropped. |
+| 6. SACK gap list truncated at 8 blocks | **Partly fixed**: the receive-side gap list is capped at 8 blocks, but inbound gap-ack blocks are now honoured (they were ignored entirely). |
+| 7. Step O(total sent) / retransmits everything | **Unchanged**: the retransmit scan is still linear over the send queue. |
+| 8. No per-message reassembly | **Unchanged**. |
+| 9. No STUN server client / srflx | **Open** — see the `STATUS.md` correction below. |
+| 10. No role-conflict handling | **Fixed**: RFC 8445 §7.3.1.1 detection and repair (487 + role switch, pair priorities recomputed, check indices remapped). |
+| 11. No RTCP in the media path | **Partly fixed**: SRTCP protect/unprotect now exists (RFC 3711 §3.4, RFC 7714 §17); there is still no RTCP scheduling or feedback loop. |
+| 12. `wr_pc_step` blocks 10 ms | **Fixed**: `pump` waits with a zero timeout. |
+| 13. `max-message-size` 262144 vs 2020-byte send cap | **Fixed as a lie, not as a capability**: the value is now a named constant tied to the receive window, and the send path still caps at 2020. |
+| 14. DTLS record size limit 2048 | **Unchanged**; an oversized datagram is now discarded with `WR_ERR_OVERFLOW` instead of being silently truncated. |
+
+Also fixed in the same pass, beyond the numbered gaps: the ICE request
+credentials were swapped (RFC 8445 §7.2.2), which made the agent unable to
+interoperate with any real peer; the SCTP cookie length was fixed at 16; the
+SCTP stream sequence number was shared across streams; `wr_pool_free` could push
+past the free stack on a double free; and the DTLS/SCTP input paths accepted
+datagrams from any source address on a shared socket.
+
 ## Verdict
 
 The core is a good *codec and data-structure* library with a solid test suite.

@@ -3,6 +3,12 @@
 
 #include "wr/ice.h"
 
+/* Upper bound on recorded connectivity checks. Each in-flight check is kept so
+ * its retransmissions and its response can be matched; the vector must not
+ * grow without bound (consent checks alone fire every few seconds for the
+ * lifetime of a session). */
+#define WR_ICE_MAX_CHECKS 128u
+
 typedef struct {
     uint16_t local;
     uint16_t remote;
@@ -62,6 +68,7 @@ struct wr_ice_agent {
 int wr_ice_pair_find(const wr_ice_agent *ag, uint32_t local, uint32_t remote);
 bool wr_ice_add_pair(wr_ice_agent *ag, uint32_t local, uint32_t remote);
 void wr_ice_form_pairs(wr_ice_agent *ag);
+void wr_ice_recompute_pair_priorities(wr_ice_agent *ag);
 
 wr_status wr_ice_send_check(wr_ice_agent *ag, size_t pair_idx, uint64_t now_ms,
                             bool use_candidate, const uint8_t *txid_in,

@@ -80,7 +80,8 @@ static void test_roundtrip(void)
     memcpy(username, "user:pass", 9u);
     WR_TEST_EQ_U64(wr_stun_build_binding_request(
                        &m, a, 0x1122334455667788ULL, 0x99aabbccddeeff00ULL,
-                       wr_span_c_make(username, 9u), 0x6e0001ffu, true, true),
+                       wr_span_c_make(username, 9u), 0x6e0001ffu,
+                       0x0f1e2d3c4b5a6978ULL, true, true),
                    WR_OK);
 
     /* The builder must not leave attribute spans pointing at its own stack
@@ -109,13 +110,33 @@ static void test_roundtrip(void)
         wr_stun_attr_find(&p, WR_STUN_ATTR_ICE_CONTROLLING);
     WR_TEST_CHECK(tie && tie->value.len == 8u);
     if (tie) {
-        WR_TEST_EQ_U64(wr_load_be64(tie->value.ptr), 0x99aabbccddeeff01ull);
+        /* The tie-breaker is the value the caller supplied, verbatim: it is
+         * an independent random value, not a function of the transaction id
+         * (RFC 8445 7.1.3). */
+        WR_TEST_EQ_U64(wr_load_be64(tie->value.ptr), 0x0f1e2d3c4b5a6978ULL);
     }
     const wr_stun_attr *uc = wr_stun_attr_find(&p, WR_STUN_ATTR_USE_CANDIDATE);
     WR_TEST_CHECK(uc != NULL);
     WR_TEST_CHECK(wr_stun_verify_fingerprint(&p));
     WR_TEST_CHECK(wr_stun_verify_integrity(&p, (const uint8_t *)"password", 8));
     WR_TEST_CHECK(!wr_stun_verify_integrity(&p, (const uint8_t *)"wrong", 5));
+
+    /* Controlling and controlled tie-breakers must differ; otherwise a role
+     * conflict can never be resolved (RFC 8445 7.3.1.1). */
+    {
+        wr_stun_msg ctl;
+        (void)wr_stun_build_binding_request(
+            &ctl, a, 0x1122334455667788ULL, 0x99aabbccddeeff00ULL,
+            wr_span_c_make(username, 9u), 0x6e0001ffu,
+            0x0f1e2d3c4b5a6979ULL, false, false);
+        const wr_stun_attr *ctl_tie =
+            wr_stun_attr_find(&ctl, WR_STUN_ATTR_ICE_CONTROLLED);
+        WR_TEST_CHECK(ctl_tie && ctl_tie->value.len == 8u);
+        if (tie && ctl_tie) {
+            WR_TEST_CHECK(wr_load_be64(tie->value.ptr) !=
+                          wr_load_be64(ctl_tie->value.ptr));
+        }
+    }
 
     /* Flip a bit in the payload covered by the MAC. */
     uint8_t copy[512];

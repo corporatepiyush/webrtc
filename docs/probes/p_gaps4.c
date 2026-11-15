@@ -22,7 +22,7 @@ int main(void){
         wr_sctp_packet p;memset(&p,0,sizeof p);
         p.src_port=ea.port;p.dst_port=ea.port;p.vtag=0x2000;
         wr_sctp_serialize(&p,wr_span_c_make(chunk,cl),raw,sizeof raw,&rl);
-        wr_sctp_input(as,1000,wr_span_c_make(raw,rl));
+        wr_sctp_input(as,1000,NULL,wr_span_c_make(raw,rl));
     }
     uint8_t buf[2048]; int pkts=0;
     for(int k=0;k<40;k++){

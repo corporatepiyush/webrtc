@@ -15,7 +15,8 @@ void *wr_arena_alloc_aligned(wr_arena *a, size_t size, size_t align);
 void *wr_arena_alloc_array(wr_arena *a, size_t count, size_t elem);
 void *wr_arena_calloc(wr_arena *a, size_t count, size_t elem);
 
-typedef struct { uint8_t *ptr; size_t used; size_t total_used; } wr_arena_mark;
+typedef struct { uint8_t *ptr; size_t used; size_t total_used;
+                  uint64_t alloc_count; uint64_t alloc_bytes; } wr_arena_mark;
 
 wr_arena_mark wr_arena_mark_save(const wr_arena *a);
 void wr_arena_mark_release(wr_arena *a, wr_arena_mark m);

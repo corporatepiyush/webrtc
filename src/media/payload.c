@@ -179,6 +179,11 @@ wr_status wr_h264_depay_input(wr_h264_depay *d, wr_span_c payload,
         bool start = (fu & 0x80u) != 0u;
         bool end = (fu & 0x40u) != 0u;
         uint8_t type = (uint8_t)(fu & 0x1fu);
+        /* RFC 6184 5.8: NAL types 1-23 may be fragmented with FU-A; type 0 and
+         * the aggregation/fragmentation types 24-31 may not. */
+        if (type == 0u || type >= 24u) {
+            return WR_ERR_INVAL;
+        }
         if (start) {
             d->active = true;
             d->ref_idc = (uint8_t)(payload.ptr[0] >> 5);
@@ -191,6 +196,13 @@ wr_status wr_h264_depay_input(wr_h264_depay *d, wr_span_c payload,
         }
         if (!d->active) {
             return WR_ERR_STATE;
+        }
+        /* A middle fragment that is also marked "end" is legal (single-fragment
+         * NAL), but a fragment whose type disagrees with the one announced by
+         * the start fragment is not: reject it instead of emitting a NAL whose
+         * header lies about its contents. */
+        if (type != d->type) {
+            return WR_ERR_INVAL;
         }
         wr_span_c frag = wr_span_c_sub(payload, 2u, payload.len - 2u);
         if (d->len + frag.len > d->cap) {
@@ -278,15 +290,40 @@ wr_status wr_vp8_depay_input(wr_vp8_depay *d, wr_span_c payload, bool marker,
     }
     uint8_t desc = payload.ptr[0];
     size_t off = 1u;
-    if (desc & 0x80u) { /* X bit */
+    if (desc & 0x80u) { /* X bit: the extension header follows */
         if (off >= payload.len) {
             return WR_ERR_TRUNCATED;
         }
         uint8_t ext = payload.ptr[off++];
-        if (ext & 0x40u) { /* TL0PICIDX */
+        /* RFC 7741 4.2: the X bit is followed by an extension header whose
+         * presence bits are I (0x80), L (0x40), T (0x20) and K (0x10). Each
+         * present field occupies one octet, in that order. Skipping only
+         * L/T (as this parser once did) desynchronises the payload whenever I
+         * or K is set, so every later packet of the frame is misparsed. */
+        if (ext & 0x80u) { /* I: PictureID, 1 or 2 octets */
+            if (off >= payload.len) {
+                return WR_ERR_TRUNCATED;
+            }
+            bool wide = (payload.ptr[off] & 0x80u) != 0u;
+            off++;
+            if (wide) {
+                /* A 16-bit PictureID occupies a second octet. */
+                if (off >= payload.len) {
+                    return WR_ERR_TRUNCATED;
+                }
+                off++;
+            }
+        }
+        if (ext & 0x40u) { /* L: TL0PICIDX */
+            if (off >= payload.len) {
+                return WR_ERR_TRUNCATED;
+            }
             off++;
         }
-        if (ext & 0x20u) { /* TID/KEYIDX */
+        if (ext & 0x20u || ext & 0x10u) { /* T: TID/KEYIDX */
+            if (off >= payload.len) {
+                return WR_ERR_TRUNCATED;
+            }
             off++;
         }
     }

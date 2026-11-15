@@ -21,6 +21,7 @@ typedef struct {
     uint32_t mask;
     uint32_t len;
     uint32_t _pad;
+    uint64_t seed; /* per-map hash seed (see map_u64.c) */
     wr_arena *a;
 } wr_u64_map;
 

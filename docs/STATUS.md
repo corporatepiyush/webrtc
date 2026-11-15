@@ -22,25 +22,27 @@ describes what happens against OpenSSL and a browser.
 | SDP: full grammar | PARTIAL | `i/u/e/p/b/k/r/z` ignored on serialize; unknown attrs retained only as raw `a=` |
 | STUN message codec | DONE | RFC 8489 subset, integrity, fingerprint |
 | STUN TURN framing | DONE | ChannelData + Allocate/Refresh/CreatePermission/ChannelBind client FSM |
-| ICE agent | DONE | Host/srflx/prflx candidates, checklist, nomination, consent, loopback |
-| ICE trickle / restart | PARTIAL | Remote candidates can be added incrementally; restart resets pairs |
+| ICE agent | DONE (host) | Host/prflx candidates, checklist, nomination, consent, loopback; RFC 8445 request credentials (fixed 2026-11-15); role-conflict repair. srflx/relay gathering is still **not** implemented (STUN client absent), which is what the older `DONE` row claimed. |
+| ICE trickle / restart | PARTIAL | Remote candidates can be added incrementally; restart resets pairs and clears stale remote candidates |
 | DTLS 1.2 record layer | DONE | Parse/serialize, epoch/seq, AES-GCM encrypt/decrypt, anti-replay fields |
 | DTLS handshake FSM | DONE | ClientHello/ServerHello/certificate/ECDHE/Finished over UDP; loopback test |
 | DTLS certificate generation/verification | DONE | Self-signed ECDSA P-256, SHA-256 fingerprint, optional peer fingerprint check |
 | SRTP AES-CM/HMAC-SHA1-80 | DONE | Protect/unprotect, replay, ROC wrap, RFC 3711 B.2/B.3 vectors, cached AES + HMAC-SHA1 pads |
 | SRTP AES-GCM (RFC 7714) | DONE | Protect/unprotect, AAD = RTP header, RFC 7714 16.1.1 vector, cached contexts |
 | SRTP key derivation | DONE | RFC 3711 KDF labels 0/1/2 |
+| SRTCP (RFC 3711 3.4) | DONE | AES-CM and GCM protect/unprotect, labels 3/4/5, E-flag/index word, replay; no RTCP scheduling above it |
+| SRTP AES-256 | DONE | AES_256_CM_HMAC_SHA1_80 and AEAD_AES_256_GCM (RFC 6188 / RFC 7714) |
 | RTP header/ext | DONE | V=2 validation, CSRC, one-byte extensions |
 | RTCP compound | DONE | SR/RR/SDES/BYE/NACK/PLI/FIR parse + serialize |
 | RTCP: XR, APP, full SDES items | MISSING | Generic APP not exposed |
 | Jitter buffer / NACK scheduler | MISSING | Hooks exist in API design; no full implementation |
 | SCTP packet/chunk codec | DONE | CRC-32c, all common chunk types parsed; word-scan SACK gaps |
-| SCTP association | PARTIAL | 4-way handshake and replay/dedup work; DATA accepted on an unestablished association, RTO retransmits the whole queue, `rwnd` is hardcoded 65535 |
+| SCTP association | PARTIAL | 4-way handshake, per-stream SSN, replay/dedup; state and verification tag enforced on every packet; packets from a non-peer source dropped; RTO retransmits only the timed-out chunk; `rwnd` reflects the real receive queue; STREAM RESET (RFC 6525) on close |
 | SCTP congestion control | PARTIAL | Slow start/CA, cwnd/ssthresh on SACK/RTO; fixed 1 s RTO |
 | DCEP | DONE | OPEN/ACK serialize/parse |
 | Data channels | PARTIAL | In-memory DATA over SCTP in tests; no DCEP channel registry |
-| PeerConnection | PARTIAL | ICE -> DTLS -> SCTP works for a single message; back-to-back sends are lost to DTLS record concatenation; no RTP/RTCP/SRTP path |
-| JSEP offer/answer state machine | DONE (minimal) | offer/answer SDP, ICE creds/candidates/fingerprint, DTLS + SCTP negotiation |
+| PeerConnection | PARTIAL | RFC 7983 demultiplexing and per-source validation in place; DTLS is on by default and requires a peer fingerprint; no RTP/RTCP/SRTP path |
+| JSEP offer/answer state machine | DONE (minimal) | offer/answer SDP, ICE creds/candidates/fingerprint, DTLS + SCTP negotiation; DTLS role follows the `setup` attribute (RFC 8842) |
 | Media payload (RTP) | DONE | RFC 6184 H.264 single NAL/FU-A, RFC 7741 VP8, RFC 7587 Opus; fuzzed |
 | Media codecs (FFmpeg) | DONE (audio+video) | H.264, VP8, Opus encode/decode; no capture/render |
 | TURN server | MISSING | Client FSM only; no TURN server |
@@ -82,6 +84,13 @@ queue corruption, RTCP NACK/FIR length-field wrapping, and STUN binding-request
 attributes retaining spans to dead stack locals. SACK gap generation was
 corrected to emit received TSN runs per RFC 4960. Earlier passes fixed SRTP
 KDF/IV/nonce bugs, EC ECDH on OpenSSL 3/4, and SCTP cumulative TSN handling.
+
+The 2026-11-15 audit pass (see `docs/REVIEW.md`, "Audit 2026-11-15") added:
+the ICE request credential swap (RFC 8445 §7.2.2), RFC 7983 demultiplexing and
+source validation in the PC/DTLS/SCTP input paths, SCTP state and verification
+tag enforcement, the pool free-stack overflow, the arena mark/release address
+assumption, SRTCP, AES-256 SRTP profiles, and removal of the `WR_DUMP` /
+`WR_TR_MODE` environment switches that printed session secrets.
 
 ## Next milestones
 

@@ -144,7 +144,7 @@ static void drain(wr_sctp_assoc *dst, wr_io *src, uint64_t now)
         if (st != WR_OK) {
             break;
         }
-        (void)wr_sctp_input(dst, now, wr_span_upcast(data));
+        (void)wr_sctp_input(dst, now, &from, wr_span_upcast(data));
     }
 }
 
@@ -255,7 +255,97 @@ static void feed_data(wr_sctp_assoc *as, uint32_t tsn, uint16_t seq,
     size_t raw_len = 0;
     WR_TEST_EQ_U64(wr_sctp_serialize(&pkt, wr_span_c_make(chunk, clen), raw,
                                      sizeof(raw), &raw_len), WR_OK);
-    (void)wr_sctp_input(as, 1000u, wr_span_c_make(raw, raw_len));
+    (void)wr_sctp_input(as, 1000u, NULL, wr_span_c_make(raw, raw_len));
+}
+
+/* A DATA chunk that arrives before the association is established must be
+ * discarded: an off-path host can otherwise seed the receive TSN window and
+ * desynchronise the handshake. */
+static void test_state_gating(void)
+{
+    wr_arena *a = wr_arena_create(64u * 1024u);
+    wr_rng *rng = wr_rng_create();
+    wr_rng_seed(rng, 12);
+    wr_sctp_assoc *as = wr_sctp_create(a, 1000, 2000, rng);
+    WR_TEST_CHECK(as != NULL);
+    if (!as) {
+        wr_rng_destroy(rng);
+        wr_arena_destroy(a);
+        return;
+    }
+    wr_sctp_start_established(as, 2000, 1000, 1000);
+    wr_sctp_delivery d;
+    WR_TEST_CHECK(wr_sctp_recv(as, &d) == false);
+
+    /* Force the association out of ESTABLISHED and inject. */
+    wr_sctp_close(as);
+    feed_data(as, 1001u, 0u, "early");
+    WR_TEST_CHECK(!wr_sctp_recv(as, &d));
+
+    wr_rng_destroy(rng);
+    wr_arena_destroy(a);
+}
+
+/* A packet whose source address is not the association's peer must be
+ * rejected, whatever it contains: SCTP has no cryptographic protection of its
+ * own, so this is the only thing standing between the association and an
+ * off-path injector. */
+static void test_source_filter(void)
+{
+    wr_arena *a = wr_arena_create(64u * 1024u);
+    wr_rng *rng = wr_rng_create();
+    wr_rng_seed(rng, 13);
+    wr_endpoint lo;
+    wr_endpoint_loopback(&lo, 0);
+    wr_io *io = wr_io_udp_create(&lo, true);
+    wr_sctp_assoc *as = wr_sctp_create(a, 1000, 2000, rng);
+    WR_TEST_CHECK(as != NULL && io != NULL);
+    if (!as || !io) {
+            wr_rng_destroy(rng);
+        wr_arena_destroy(a);
+        return;
+    }
+    wr_endpoint peer, other;
+    uint8_t pip[4] = { 10, 0, 0, 1 };
+    uint8_t oip[4] = { 10, 0, 0, 2 };
+    wr_endpoint_v4(&peer, pip, 5000);
+    wr_endpoint_v4(&other, oip, 5000);
+    wr_sctp_attach_io(as, io, &peer);
+    wr_sctp_start_established(as, 2000, 1000, 1000);
+
+    char body[128];
+    size_t blen = 0;
+    wr_sctp_data_body(1000u, 0u, 0u, 42u, wr_span_c_from_str("spoof"), body,
+                      sizeof(body), &blen);
+    char chunk[192];
+    size_t clen = 0;
+    wr_sctp_chunk_serialize(WR_SCTP_DATA, 0x03u, wr_span_c_make(body, blen),
+                            chunk, sizeof(chunk), &clen);
+    char raw[256];
+    size_t raw_len = 0;
+    wr_sctp_packet pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.src_port = 2000;
+    pkt.dst_port = 1000;
+    pkt.vtag = 2000;
+    WR_TEST_EQ_U64(wr_sctp_serialize(&pkt, wr_span_c_make(chunk, clen), raw,
+                                     sizeof(raw), &raw_len),
+                   WR_OK);
+
+    WR_TEST_EQ_U64(wr_sctp_input(as, 1u, &other, wr_span_c_make(raw, raw_len)),
+                   WR_ERR_AUTH);
+    wr_sctp_delivery d;
+    WR_TEST_CHECK(!wr_sctp_recv(as, &d));
+
+    WR_TEST_EQ_U64(wr_sctp_input(as, 1u, &peer, wr_span_c_make(raw, raw_len)),
+                   WR_OK);
+    WR_TEST_CHECK(wr_sctp_recv(as, &d));
+    WR_TEST_EQ_U64(d.data.len, 5u);
+    WR_TEST_EQ_U64(memcmp(d.data.ptr, "spoof", 5), 0);
+
+    wr_io_destroy(io);
+    wr_rng_destroy(rng);
+    wr_arena_destroy(a);
 }
 
 static void test_reassembly(void)
@@ -403,7 +493,7 @@ static void sctp_pump(wr_sctp_assoc *dst, wr_io *src, uint64_t now)
             WR_OK) {
             return;
         }
-        (void)wr_sctp_input(dst, now, wr_span_upcast(data));
+        (void)wr_sctp_input(dst, now, &from, wr_span_upcast(data));
     }
 }
 
@@ -619,6 +709,8 @@ void test_sctp(void)
     test_lossy();
     test_tsn_gaps();
     test_tsn_rotation();
+    test_state_gating();
+    test_source_filter();
 }
 static int lossy_pump(wr_sctp_assoc *dst, wr_io *src, uint64_t now, int step)
 {
@@ -639,10 +731,10 @@ static int lossy_pump(wr_sctp_assoc *dst, wr_io *src, uint64_t now, int step)
         if (step % 5 == 0) {
             continue; /* drop */
         }
-        (void)wr_sctp_input(dst, now, wr_span_upcast(data));
+        (void)wr_sctp_input(dst, now, &from, wr_span_upcast(data));
         delivered++;
         if (step % 7 == 0) {
-            (void)wr_sctp_input(dst, now, wr_span_upcast(data)); /* duplicate */
+            (void)wr_sctp_input(dst, now, &from, wr_span_upcast(data)); /* duplicate */
         }
     }
     return delivered;

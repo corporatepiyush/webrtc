@@ -26,7 +26,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     wr_sctp_start_established(as, 0x1000u, 0x2000u, 0x2000u);
 
     /* Raw fuzz: must be rejected by CRC or length checks. */
-    (void)wr_sctp_input(as, 0u, wr_span_c_make(data, size));
+    (void)wr_sctp_input(as, 0u, NULL, wr_span_c_make(data, size));
 
     /* Structured DATA: build a valid packet from the tail of the input. */
     if (size >= 8u) {
@@ -52,7 +52,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 size_t raw_len = 0u;
                 if (wr_sctp_serialize(&pkt, wr_span_c_make(chunk, clen), raw,
                                       sizeof(raw), &raw_len) == WR_OK) {
-                    (void)wr_sctp_input(as, 0u,
+                    (void)wr_sctp_input(as, 0u, NULL,
                                         wr_span_c_make(raw, raw_len));
                 }
             }

@@ -25,7 +25,7 @@ int main(void){
     p.src_port=self.port; p.dst_port=self.port; p.vtag=0xdeadbeefu;   /* bogus vtag */
     wr_sctp_serialize(&p, wr_span_c_make(chunk,clen), raw, sizeof raw, &rawlen);
 
-    wr_status st = wr_sctp_input(as, 1000, wr_span_c_make(raw,rawlen));
+    wr_status st = wr_sctp_input(as, 1000, NULL, wr_span_c_make(raw,rawlen));
     printf("input on CLOSED assoc with bogus vtag -> %d (%s)\n", st, wr_status_str(st));
 
     wr_sctp_delivery d;

@@ -12,6 +12,7 @@
 typedef struct {
     uint8_t *objects;
     uint32_t *free_stack;
+    uint8_t *used_bits; /* one bit per slot: set while allocated */
     uint32_t cap;
     uint32_t elem;
     uint32_t in_use;

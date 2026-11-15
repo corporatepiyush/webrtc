@@ -196,7 +196,9 @@ static void bench_stun(void)
     wr_status st = wr_stun_build_binding_request(&m, a, 0x1122334455667788ull,
                                                  0x99aabbccddeeff00ull,
                                                  wr_span_c_from_str("user:pass"),
-                                                 0x6e0001ffu, true, true);
+                                                 0x6e0001ffu,
+                                                 0x0f1e2d3c4b5a6978ull,
+                                                 true, true);
     char buf[512];
     size_t n = 0;
     wr_status st2 = wr_stun_append_integrity(&m, (const uint8_t *)"password", 8,
@@ -453,7 +455,7 @@ static void bench_sctp_input(void)
     uint64_t t0 = now_ns();
     uint64_t sink = 0u;
     for (int i = 0; i < N; ++i) {
-        if (wr_sctp_input(as, (uint64_t)i,
+        if (wr_sctp_input(as, (uint64_t)i, NULL,
                           wr_span_c_make(raws[i], raw_len)) != WR_OK) {
             printf("sctp input failed at %d\n", i);
             break;

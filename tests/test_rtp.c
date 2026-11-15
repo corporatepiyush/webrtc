@@ -4,6 +4,9 @@
 
 static void test_rtp_basic(void)
 {
+    /* A minimal extension body: one-byte headers 0x10 (id 1, len 1) + 0xAA and
+     * 0x20 (id 2, len 1) + 0xBB = four bytes, one 32-bit word. */
+    static const uint8_t ext_body[4] = { 0x10, 0xaa, 0x20, 0xbb };
     uint8_t pkt[64];
     pkt[0] = 0x80;
     pkt[1] = 0x00;
@@ -32,7 +35,8 @@ static void test_rtp_basic(void)
     pkt[0] = 0x00;
     WR_TEST_CHECK(!wr_rtp_parse(wr_span_c_make(pkt, 15), &h));
 
-    /* Serializer refuses layouts it cannot emit. */
+    /* Serializer refuses layouts it cannot emit: a CSRC list and padding are
+     * not modelled by wr_rtp_hdr. */
     wr_rtp_hdr h2;
     memset(&h2, 0, sizeof(h2));
     h2.pt = 96;
@@ -41,9 +45,29 @@ static void test_rtp_basic(void)
     WR_TEST_CHECK(wr_rtp_serialize(&h2, wr_span_c_from_str("x"), out,
                                    sizeof(out), &n) == WR_ERR_UNSUPPORTED);
     h2.cc = 0;
-    h2.ext = 1;
+    h2.padding = 1;
     WR_TEST_CHECK(wr_rtp_serialize(&h2, wr_span_c_from_str("x"), out,
                                    sizeof(out), &n) == WR_ERR_UNSUPPORTED);
+
+    /* Header extensions are emitted with the 0xBEDE profile; a body that is
+     * not a whole number of 32-bit words is rejected. */
+    wr_rtp_hdr h3;
+    memset(&h3, 0, sizeof(h3));
+    h3.pt = 96;
+    h3.seq = 1;
+    h3.ext = 1;
+    h3.ext_raw = wr_span_c_make(ext_body, sizeof(ext_body));
+    WR_TEST_EQ_U64(wr_rtp_serialize(&h3, wr_span_c_from_str("x"), out,
+                                    sizeof(out), &n),
+                   WR_OK);
+    wr_rtp_hdr rt;
+    WR_TEST_CHECK(wr_rtp_parse(wr_span_c_make(out, n), &rt));
+    WR_TEST_EQ_U64(rt.ext, 1);
+    WR_TEST_EQ_U64(rt.header_len, 20);
+    WR_TEST_EQ_U64(rt.payload_len, 1);
+    h3.ext_raw = wr_span_c_make(ext_body, 3u); /* not word-aligned */
+    WR_TEST_CHECK(wr_rtp_serialize(&h3, wr_span_c_from_str("x"), out,
+                                   sizeof(out), &n) == WR_ERR_INVAL);
 }
 
 static void test_rtp_ext(void)
@@ -79,6 +103,31 @@ static void test_rtp_ext(void)
     WR_TEST_EQ_U64(data[0].ptr[0], 0xaa);
     WR_TEST_EQ_U64(ids[1], 2);
     WR_TEST_EQ_U64(data[1].ptr[0], 0xbb);
+
+    /* Two-byte form (RFC 8285 4.3): 8-bit id, 8-bit length, no padding.
+     * id 3 len 2 "hi", id 4 len 1 "!", then a zero id terminating. */
+    uint8_t two[8] = { 3u, 2u, 'h', 'i', 4u, 1u, '!', 0u };
+    count = 0;
+    (void)wr_rtp_ext_parse_form(wr_span_c_make(two, sizeof(two)), true, ids,
+                                data, 4, &count);
+    WR_TEST_EQ_U64(count, 2);
+    WR_TEST_EQ_U64(ids[0], 3);
+    WR_TEST_EQ_U64(data[0].len, 2);
+    WR_TEST_EQ_U64(memcmp(data[0].ptr, "hi", 2), 0);
+    WR_TEST_EQ_U64(ids[1], 4);
+    WR_TEST_EQ_U64(data[1].ptr[0], '!');
+    /* The same bytes are not valid one-byte elements: the leading 3 means
+     * "id 0, length 4", which is a padding/terminator. */
+    count = 0;
+    (void)wr_rtp_ext_parse_form(wr_span_c_make(two, sizeof(two)), false, ids,
+                                data, 4, &count);
+    WR_TEST_EQ_U64(count, 0);
+    /* A truncated two-byte element stops the walk. */
+    uint8_t two_trunc[3] = { 9u, 16u, 0u };
+    count = 0;
+    (void)wr_rtp_ext_parse_form(wr_span_c_make(two_trunc, sizeof(two_trunc)),
+                                true, ids, data, 4, &count);
+    WR_TEST_EQ_U64(count, 0);
 }
 
 static void test_rtcp_sr(void)

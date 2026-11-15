@@ -5,6 +5,11 @@
 #define WR_CHUNK_BYTES ((size_t)64u * 1024u)
 #define WR_MAX_ALIGN   ((size_t)64u)
 
+/* mark_release() must not rely on the relative addresses of malloc'd chunks: a
+ * chunk allocated after the mark can legitimately land at a lower address once
+ * a previous chunk has been freed and recycled, which would make address
+ * ordering free the wrong block and then clamp `used` onto the wrong chunk.
+ * Identify the marked chunk by containment in the chunk list instead. */
 typedef struct wr_chunk {
     struct wr_chunk *next;
     uint8_t *data;
@@ -158,6 +163,8 @@ wr_arena_mark wr_arena_mark_save(const wr_arena *a)
     m.ptr = a->head ? a->head->data : NULL;
     m.used = a->head ? a->head->used : 0u;
     m.total_used = a->used;
+    m.alloc_count = a->alloc_count;
+    m.alloc_bytes = a->alloc_bytes;
     return m;
 }
 
@@ -166,17 +173,49 @@ void wr_arena_mark_release(wr_arena *a, wr_arena_mark m)
     if (!a || !a->head) {
         return;
     }
+    if (!m.ptr) {
+        /* Mark taken with an empty arena: release everything. */
+        wr_chunk *c = a->head;
+        while (c) {
+            wr_chunk *next = c->next;
+            free(c);
+            c = next;
+        }
+        a->head = NULL;
+        a->used = m.total_used;
+        a->alloc_count = m.alloc_count;
+        a->alloc_bytes = m.alloc_bytes;
+        return;
+    }
     wr_chunk *c = a->head;
-    while (c && c->data > m.ptr) {
-        wr_chunk *next = c->next;
-        free(c);
-        c = next;
+    while (c && (m.ptr < c->data || m.ptr >= c->data + c->cap)) {
+        c = c->next;
+    }
+    if (!c) {
+        /* The mark's chunk is gone (reset or release of an older mark). There
+         * is no defined subset to restore, so collapse to empty rather than
+         * corrupting a live chunk's `used`. */
+        wr_chunk *cur = a->head;
+        while (cur) {
+            wr_chunk *next = cur->next;
+            free(cur);
+            cur = next;
+        }
+        a->head = NULL;
+        a->used = 0u;
+        return;
+    }
+    wr_chunk *newer = a->head;
+    while (newer != c) {
+        wr_chunk *next = newer->next;
+        free(newer);
+        newer = next;
     }
     a->head = c;
-    if (a->head) {
-        a->head->used = m.used;
-    }
+    c->used = m.used;
     a->used = m.total_used;
+    a->alloc_count = m.alloc_count;
+    a->alloc_bytes = m.alloc_bytes;
 }
 
 void wr_arena_reset(wr_arena *a)

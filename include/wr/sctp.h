@@ -75,6 +75,7 @@ typedef enum {
     WR_SCTP_ST_COOKIE_SENT,
     WR_SCTP_ST_ESTABLISHED,
     WR_SCTP_ST_CLOSING,
+    WR_SCTP_ST_FAILED, /* appended: the association was aborted locally */
 } wr_sctp_state;
 
 typedef struct wr_sctp_assoc wr_sctp_assoc;
@@ -119,7 +120,13 @@ void wr_sctp_start_established(wr_sctp_assoc *as, uint32_t my_vtag,
                                uint32_t peer_vtag, uint32_t peer_initial_tsn);
 wr_status wr_sctp_send_data(wr_sctp_assoc *as, uint16_t stream, uint32_t ppid,
                             wr_span_c data, uint64_t now_ms);
-wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms, wr_span_c packet);
+/* `from` is the source address of the datagram as reported by the transport.
+ * It must match the association's peer: SCTP cannot tell an injected packet
+ * from a legitimate one, so an off-path attacker could otherwise drive the
+ * state machine with DATA/INIT/SHUTDOWN chunks. Pass NULL only when the
+ * transport is already point-to-point and has validated the source. */
+wr_status wr_sctp_input(wr_sctp_assoc *as, uint64_t now_ms,
+                        const wr_endpoint *from, wr_span_c packet);
 wr_status wr_sctp_step(wr_sctp_assoc *as, uint64_t now_ms);
 bool wr_sctp_recv(wr_sctp_assoc *as, wr_sctp_delivery *out);
 uint32_t wr_sctp_last_ack(const wr_sctp_assoc *as);

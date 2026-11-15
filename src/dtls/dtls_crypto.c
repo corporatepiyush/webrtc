@@ -164,11 +164,25 @@ void wr_dtls_derive_keys(wr_dtls *d, wr_span_c shared)
     if (shared.len != 32u) {
         return;
     }
-    uint8_t seed[64];
-    memcpy(seed, d->client_random, 32);
-    memcpy(seed + 32, d->server_random, 32);
-    wr_dtls_prf(shared.ptr, 32, wr_span_c_from_str("master secret"),
-                wr_span_c_make(seed, 64), d->master, sizeof(d->master));
+    if (d->use_ems && d->tr_len != 0u) {
+        /* RFC 7627: master = PRF(pre, "extended master secret", session_hash),
+         * where the session hash covers handshake messages up to and including
+         * the ClientKeyExchange. Both peers reach this point with identical
+         * transcript contents. */
+        uint8_t sh[32];
+        wr_crypto_sha256(wr_span_c_make(d->transcript, d->tr_len), sh);
+        wr_dtls_prf(shared.ptr, 32,
+                    wr_span_c_from_str("extended master secret"),
+                    wr_span_c_make(sh, 32), d->master, sizeof(d->master));
+        wr_secure_zero(sh, sizeof(sh));
+    } else {
+        uint8_t seed[64];
+        memcpy(seed, d->client_random, 32);
+        memcpy(seed + 32, d->server_random, 32);
+        wr_dtls_prf(shared.ptr, 32, wr_span_c_from_str("master secret"),
+                    wr_span_c_make(seed, 64), d->master, sizeof(d->master));
+        wr_secure_zero(seed, sizeof(seed));
+    }
 
     uint8_t seed2[64];
     memcpy(seed2, d->server_random, 32);

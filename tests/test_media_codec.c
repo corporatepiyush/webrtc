@@ -152,6 +152,10 @@ static void test_h264(void)
         if (gotf) {
             WR_TEST_EQ_U64((uint32_t)f.width, W);
             WR_TEST_EQ_U64((uint32_t)f.height, H);
+            /* A YUV420p frame exposes all three planes and a real stride. */
+            WR_TEST_CHECK(f.data != NULL);
+            WR_TEST_CHECK(f.data_u != NULL && f.data_v != NULL);
+            WR_TEST_CHECK(f.linesize >= (size_t)W);
         }
         wr_media_dec_destroy(d2);
     }

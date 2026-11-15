@@ -1,5 +1,6 @@
 #include "wr/log.h"
 
+#include <pthread.h>
 #include <stdio.h>
 
 #if defined(__clang__)
@@ -17,6 +18,12 @@ typedef struct {
 static wr_log_state g_log = {
     NULL, NULL, WR_LOG_WARN
 };
+
+/* The sink and level are process-wide and may be read from any thread while
+ * another thread installs a new sink. Serialize access; the sink itself is
+ * invoked with the lock released so a sink that logs recursively cannot
+ * deadlock. */
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *level_name(wr_log_level l)
 {
@@ -45,24 +52,37 @@ static void default_sink(void *ctx, wr_log_level lvl, const char *module,
 
 void wr_log_set_sink(wr_log_sink sink, void *ctx, wr_log_level min_level)
 {
+    pthread_mutex_lock(&g_log_lock);
     g_log.sink = sink;
     g_log.ctx = ctx;
     g_log.min_level = min_level;
+    pthread_mutex_unlock(&g_log_lock);
 }
 
 wr_log_level wr_log_get_level(void)
 {
-    return g_log.min_level;
+    pthread_mutex_lock(&g_log_lock);
+    wr_log_level l = g_log.min_level;
+    pthread_mutex_unlock(&g_log_lock);
+    return l;
 }
 
 void wr_log_write(const char *module, wr_log_level lvl, const char *fmt, ...)
 {
-    if (lvl > g_log.min_level || !fmt) {
+    pthread_mutex_lock(&g_log_lock);
+    wr_log_sink sink = g_log.sink;
+    void *ctx = g_log.ctx;
+    wr_log_level min_level = g_log.min_level;
+    pthread_mutex_unlock(&g_log_lock);
+
+    if (lvl > min_level || !fmt) {
         return;
     }
-    wr_log_sink sink = g_log.sink ? g_log.sink : default_sink;
+    if (!sink) {
+        sink = default_sink;
+    }
     va_list ap;
     va_start(ap, fmt);
-    sink(g_log.ctx, lvl, module ? module : "?", fmt, ap);
+    sink(ctx, lvl, module ? module : "?", fmt, ap);
     va_end(ap);
 }

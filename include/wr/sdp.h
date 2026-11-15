@@ -77,7 +77,9 @@ typedef struct {
 } wr_sdp_candidate;
 
 typedef struct {
-    bool present;
+    bool present; /* both ufrag and pwd were present and non-empty */
+    bool has_ufrag;
+    bool has_pwd;
     wr_span_c ufrag;
     wr_span_c pwd;
     wr_span_c options;

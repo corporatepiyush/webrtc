@@ -101,6 +101,26 @@ static void test_h264(void)
                    WR_ERR_AGAIN);
     WR_TEST_EQ_U64(wr_h264_depay_input(&d, wr_span_c_make(bad, 1), &x),
                    WR_ERR_TRUNCATED);
+
+    /* A middle fragment that announces a different NAL type than the start
+     * fragment must be rejected (RFC 6184 5.8). */
+    wr_h264_depay d2;
+    wr_h264_depay_init(&d2, nalbuf, sizeof(nalbuf));
+    uint8_t fu_start[3] = { 0x7c, 0x85, 0xaa }; /* S=1, type 5 */
+    WR_TEST_EQ_U64(wr_h264_depay_input(&d2, wr_span_c_make(fu_start, 3), &x),
+                   WR_ERR_AGAIN);
+    uint8_t fu_mid[3] = { 0x7c, 0x01, 0xbb }; /* no S/E, type 1: mismatch */
+    WR_TEST_EQ_U64(wr_h264_depay_input(&d2, wr_span_c_make(fu_mid, 3), &x),
+                   WR_ERR_INVAL);
+    /* A non-fragmentable NAL type (24-31) is malformed in an FU-A. */
+    uint8_t fu_bad_type[3] = { 0x7c, 0x19, 0x00 }; /* type 25 */
+    WR_TEST_EQ_U64(wr_h264_depay_input(&d2, wr_span_c_make(fu_bad_type, 3), &x),
+                   WR_ERR_INVAL);
+    /* A non-VCL but fragmentable type (e.g. SEI, 6) is accepted as a start
+     * fragment. */
+    uint8_t fu_sei[3] = { 0x7c, 0x86, 0x00 }; /* S=1, type 6 */
+    WR_TEST_EQ_U64(wr_h264_depay_input(&d2, wr_span_c_make(fu_sei, 3), &x),
+                   WR_ERR_AGAIN);
 }
 
 static void test_vp8(void)
@@ -148,6 +168,45 @@ static void test_vp8(void)
     WR_TEST_EQ_U64(got_len, sizeof(frame));
     if (got_len == sizeof(frame)) {
         WR_TEST_EQ_U64(memcmp(got.ptr, frame, sizeof(frame)), 0);
+    }
+
+    /* VP8 payload descriptor: the extension header presence bits are I, L, T
+     * and K (RFC 7741 4.2). A packet with I and K set but not L/T used to be
+     * parsed with a two-byte offset, so the frame was misaligned. */
+    {
+        uint8_t reasm2[64];
+        wr_vp8_depay d2;
+        wr_vp8_depay_init(&d2, reasm2, sizeof(reasm2));
+        wr_span_c out2;
+        /* Descriptor: X=1 (0x80) | S=1 (0x10); ext byte: I|K = 0x90;
+         * PictureID (1 byte, high bit clear) = 0x7f; KEYIDX = 0x2a. */
+        uint8_t p1[6] = { 0x90u, 0x90u, 0x7fu, 0x2au, 0xde, 0xad };
+        WR_TEST_EQ_U64(wr_vp8_depay_input(&d2, wr_span_c_make(p1, 2), false,
+                                          &out2),
+                       WR_ERR_TRUNCATED);
+        WR_TEST_EQ_U64(wr_vp8_depay_input(&d2, wr_span_c_make(p1, sizeof(p1)),
+                                          false, &out2),
+                       WR_ERR_AGAIN);
+        /* The two payload bytes must be the frame bytes, not the descriptor. */
+        uint8_t p2[3] = { 0x00u, 0xbe, 0xef };
+        WR_TEST_EQ_U64(wr_vp8_depay_input(&d2, wr_span_c_make(p2, 3), true,
+                                          &out2),
+                       WR_OK);
+        WR_TEST_EQ_U64(out2.len, 4u);
+        WR_TEST_EQ_U64(memcmp(out2.ptr, "\xde\xad\xbe\xef", 4), 0);
+    }
+    /* A 16-bit PictureID (high bit set) occupies two octets. */
+    {
+        uint8_t reasm3[64];
+        wr_vp8_depay d3;
+        wr_vp8_depay_init(&d3, reasm3, sizeof(reasm3));
+        wr_span_c out3;
+        uint8_t p[7] = { 0x90u, 0x90u, 0xffu, 0xffu, 0x2au, 0x11, 0x22 };
+        WR_TEST_EQ_U64(wr_vp8_depay_input(&d3, wr_span_c_make(p, sizeof(p)),
+                                          true, &out3),
+                       WR_OK);
+        WR_TEST_EQ_U64(out3.len, 2u);
+        WR_TEST_EQ_U64(memcmp(out3.ptr, "\x11\x22", 2), 0);
     }
 }
 

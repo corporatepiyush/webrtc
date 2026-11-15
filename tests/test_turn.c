@@ -3,6 +3,44 @@
 #include "wr/stun.h"
 #include "wr/turn.h"
 
+#include <openssl/evp.h>
+
+/* Receive one STUN message from the fake TURN server socket. */
+static bool recv_stun(wr_io *io, wr_arena *a, wr_stun_msg *out)
+{
+    uint8_t buf[512];
+    for (int i = 0; i < 4; ++i) {
+        bool ready = false;
+        if (wr_io_wait(io, 5u, &ready) != WR_OK || !ready) {
+            return false;
+        }
+        wr_endpoint from;
+        wr_span data;
+        if (wr_io_recv(io, &from, wr_span_make(buf, sizeof(buf)), &data) !=
+            WR_OK) {
+            return false;
+        }
+        if (wr_stun_parse(a, wr_span_upcast(data), WR_STUN_LIBERAL, out) ==
+            WR_OK) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* RFC 8656 9.2.4: long-term credential key = MD5(user ":" realm ":" pass). */
+static void turn_key(const char *user, const char *realm, const char *pass,
+                     uint8_t key[16])
+{
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "%s:%s:%s", user, realm, pass);
+    unsigned int md_len = 0u;
+    if (n <= 0 || EVP_Digest(buf, (size_t)n, key, &md_len, EVP_md5(), NULL) != 1 ||
+        md_len != 16u) {
+        memset(key, 0, 16);
+    }
+}
+
 static void test_channel_queue(void)
 {
     wr_arena *a = wr_arena_create(64u * 1024u);
@@ -77,14 +115,16 @@ void test_turn(void)
     WR_TEST_EQ_U64(wr_turn_start(t, 0u), WR_OK);
     WR_TEST_EQ_U64(wr_turn_get_status(t), WR_TURN_ALLOCATING);
 
-    uint8_t txid[12];
-    for (int i = 0; i < 12; ++i) txid[i] = (uint8_t)(0x30 + i);
+    /* The first Allocate carries no credentials: answer 401 with a realm and
+     * nonce, echoing the transaction id the client actually chose. */
+    wr_stun_msg req;
+    WR_TEST_CHECK(recv_stun(io_b, a, &req));
     char resp[512];
     size_t rn = 0u;
     wr_stun_msg m;
     wr_stun_msg_init(&m, a, wr_stun_type(WR_STUN_METHOD_ALLOCATE,
                                          WR_STUN_CLASS_ERROR),
-                     txid);
+                     req.txid);
     uint8_t err[4] = { 0, 0, 4, 1 };
     (void)wr_stun_attr_add(&m, WR_STUN_ATTR_ERROR_CODE,
                            wr_span_c_make(err, 4u));
@@ -96,24 +136,31 @@ void test_turn(void)
     WR_TEST_EQ_U64(wr_turn_input(t, 1u, wr_span_c_make(resp, rn)), WR_OK);
     WR_TEST_EQ_U64(wr_turn_get_status(t), WR_TURN_AUTHENTICATING);
 
+    /* Authenticated Allocate; the server answers with an integrity-protected
+     * success carrying the relayed address. */
+    WR_TEST_CHECK(recv_stun(io_b, a, &req));
+    wr_stun_msg_init(&m, a, wr_stun_type(WR_STUN_METHOD_ALLOCATE,
+                                         WR_STUN_CLASS_SUCCESS),
+                     req.txid);
     uint8_t peer[32];
     size_t plen = 0u;
     wr_endpoint relayed_ep;
     wr_endpoint_v4(&relayed_ep, (const uint8_t[4]){ 198, 51, 100, 1 }, 3478);
-    WR_TEST_CHECK(wr_stun_addr_encode(peer, sizeof(peer), &relayed_ep,
-                                      true, txid, &plen));
-    (void)wr_stun_addr_decode(wr_span_c_make(peer, plen), true, txid,
+    WR_TEST_CHECK(wr_stun_addr_encode(peer, sizeof(peer), &relayed_ep, true,
+                                      req.txid, &plen));
+    (void)wr_stun_addr_decode(wr_span_c_make(peer, plen), true, req.txid,
                               &relayed_ep);
-    wr_stun_msg_init(&m, a, wr_stun_type(WR_STUN_METHOD_ALLOCATE,
-                                         WR_STUN_CLASS_SUCCESS),
-                     txid);
     uint8_t life[4];
     wr_store_be32(life, 600u);
     (void)wr_stun_attr_add(&m, WR_STUN_ATTR_XOR_RELAYED_ADDRESS,
                            wr_span_c_make(peer, plen));
     (void)wr_stun_attr_add(&m, WR_STUN_ATTR_LIFETIME,
                            wr_span_c_make(life, 4u));
-    WR_TEST_EQ_U64(wr_stun_serialize(&m, resp, sizeof(resp), &rn), WR_OK);
+    uint8_t key[16];
+    turn_key("user", "example.org", "pass", key);
+    WR_TEST_EQ_U64(wr_stun_append_integrity(&m, key, sizeof(key), resp,
+                                            sizeof(resp), &rn),
+                   WR_OK);
     WR_TEST_EQ_U64(wr_turn_input(t, 2u, wr_span_c_make(resp, rn)), WR_OK);
     WR_TEST_EQ_U64(wr_turn_get_status(t), WR_TURN_ALLOCATED);
     const wr_endpoint *r = wr_turn_relayed(t);
@@ -127,26 +174,31 @@ void test_turn(void)
     wr_endpoint_v4(&peer_ep, (const uint8_t[4]){ 192, 0, 2, 9 }, 5000);
     WR_TEST_EQ_U64(wr_turn_connect(t, &peer_ep, 0x4000u), WR_OK);
 
-    /* ChannelBind success. */
+    /* CreatePermission and ChannelBind share the transaction id. Answer both
+     * with integrity-protected successes. */
+    WR_TEST_CHECK(recv_stun(io_b, a, &req));
+    wr_stun_msg_init(&m, a, wr_stun_type(WR_STUN_METHOD_CREATE_PERMISSION,
+                                         WR_STUN_CLASS_SUCCESS),
+                     req.txid);
+    (void)wr_stun_append_integrity(&m, key, sizeof(key), resp, sizeof(resp),
+                                   &rn);
+    (void)wr_turn_input(t, 3u, wr_span_c_make(resp, rn));
+    WR_TEST_CHECK(recv_stun(io_b, a, &req));
     wr_stun_msg_init(&m, a, wr_stun_type(WR_STUN_METHOD_CHANNEL_BIND,
                                          WR_STUN_CLASS_SUCCESS),
-                     txid);
-    WR_TEST_EQ_U64(wr_stun_serialize(&m, resp, sizeof(resp), &rn), WR_OK);
+                     req.txid);
+    (void)wr_stun_append_integrity(&m, key, sizeof(key), resp, sizeof(resp),
+                                   &rn);
     (void)wr_turn_input(t, 3u, wr_span_c_make(resp, rn));
 
-    /* Drain the CreatePermission/ChannelBind requests from the fake server. */
-    for (int i = 0; i < 8; ++i) {
-        bool rr = false;
-        (void)wr_io_wait(io_b, 1u, &rr);
-        if (!rr) {
-            break;
-        }
-        uint8_t scratch[256];
-        wr_endpoint from2;
-        wr_span dd;
-        (void)wr_io_recv(io_b, &from2, wr_span_make(scratch, sizeof(scratch)),
-                         &dd);
-    }
+    /* An unauthenticated success for an authenticated request must be
+     * rejected: a spoofed relayed address would otherwise be accepted. */
+    wr_stun_msg_init(&m, a, wr_stun_type(WR_STUN_METHOD_REFRESH,
+                                         WR_STUN_CLASS_SUCCESS),
+                     req.txid);
+    WR_TEST_EQ_U64(wr_stun_serialize(&m, resp, sizeof(resp), &rn), WR_OK);
+    WR_TEST_EQ_U64(wr_turn_input(t, 4u, wr_span_c_make(resp, rn)),
+                   WR_ERR_AUTH);
 
     WR_TEST_EQ_U64(wr_turn_send(t, wr_span_c_from_str("turn")), WR_OK);
     uint8_t buf[128];

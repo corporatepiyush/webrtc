@@ -97,12 +97,22 @@ void wr_dtls_destroy(wr_dtls *d);
 
 wr_status wr_dtls_start(wr_dtls *d, uint64_t now_ms);
 wr_status wr_dtls_step(wr_dtls *d, uint64_t now_ms);
-wr_status wr_dtls_input(wr_dtls *d, wr_span_c pkt);
+/* `from` is the source address of the datagram. When the socket is shared
+ * with other protocols the caller must pass it: DTLS is point-to-point, so
+ * a record from any other address is dropped before parsing. Pass NULL only
+ * when the transport is already a dedicated, validated path. */
+wr_status wr_dtls_input(wr_dtls *d, const wr_endpoint *from,
+                        wr_span_c pkt);
 wr_status wr_dtls_send(wr_dtls *d, wr_span_c app);
 bool wr_dtls_recv(wr_dtls *d, wr_span_c *out);
 uint32_t wr_dtls_recv_drops(const wr_dtls *d);
 bool wr_dtls_ready(const wr_dtls *d);
 wr_dtls_status wr_dtls_state(const wr_dtls *d);
+/* Set the handshake role before the handshake starts. The DTLS role is
+ * negotiated by the SDP `setup` attribute, not by the ICE role, so the peer
+ * connection may need to correct the role chosen when the certificate was
+ * minted. Returns false once the handshake has begun. */
+bool wr_dtls_set_role(wr_dtls *d, wr_dtls_role role);
 
 const uint8_t *wr_dtls_fingerprint(const wr_dtls *d, size_t *len);
 bool wr_dtls_set_peer_fingerprint(wr_dtls *d, const uint8_t *fp, size_t len);

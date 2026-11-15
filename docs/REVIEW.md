@@ -18,6 +18,101 @@ defect below has a regression test or a fuzz target that would have caught it.
 | 8 | Adversarial black-box audit | 8 + hardening |
 | 9 | SACK gap semantics + module split | 1 + build/coverage evidence |
 | 10 | Real-peer gap analysis (OpenSSL DTLS, burst sends) | 7, all measured |
+| 11 | Full-codebase audit (2026-11-15) | 2 Critical + 27 Important + 8 Suggestion; all Critical and 27 Important fixed |
+
+---
+
+# Pass 11 — full-codebase audit (2026-11-15)
+
+Audit-only pass: every source file was read, protocol claims were checked
+against the RFCs, and the fixes below were then applied (this is the only pass
+that both audited and repaired).
+
+## Fixed
+
+### 1. ICE request credentials were swapped (Critical)
+
+RFC 8445 §7.2.2: a Binding **request** is integrity-protected with the *peer's*
+password, and an inbound request is verified with the **local** password;
+responses reuse the credentials of the request they answer. `ice_check.c` signed
+outbound requests with `local_pwd` and verified inbound requests with
+`remote_pwd`. Responses were already correct.
+
+The agent was therefore self-consistent and completely unable to interoperate:
+every real peer would reject the HMAC in both directions. Regression test:
+`test_role_conflict` drives two agents with swapped credentials.
+
+### 2. No DTLS client authentication and no source validation (Critical)
+
+One-sided authentication is correct for WebRTC (RFC 8842 §5.1: the DTLS client
+is the only side that presents a certificate), so that part is by design. The
+exploitable part was the combination of three fail-open points:
+
+- the peer fingerprint was optional, and a fingerprint with an unrecognised
+  hash silently disabled verification rather than aborting;
+- `pump()` routed by "has ICE finished" rather than by content, so any datagram
+  on the socket reached the DTLS parser, including after ICE completed;
+- neither `wr_dtls_input` nor `wr_sctp_input` was told where a datagram came
+  from, and `wr_io` discarded the source endpoint for DTLS records.
+
+Fixed with RFC 7983 demultiplexing (`demux()`), a source parameter on both input
+functions, and fail-closed checks in `wr_pc_start` / `wr_pc_set_remote_description`.
+
+### 3. SCTP accepted control and data chunks in any state (Critical)
+
+`handle_data` had no state check, the packet verification tag was validated only
+once ESTABLISHED, an INIT from any source moved the association to COOKIE_ECHOED
+and was answered at the configured peer, and a retransmitted INIT was dropped
+(wedging the peer). Fixed with a state check, a verification-tag check in every
+state (RFC 4960 §8.4.1), source filtering, and replaying the stored INIT_ACK.
+
+### 4. Environment switches dumped session secrets (Critical)
+
+`getenv("WR_DUMP")` printed the master secret, the write key and salt, the ECDH
+private key, the shared secret, every handshake flight and the transcript.
+`getenv("WR_TR_MODE")` changed the transcript construction. Both are removed.
+
+### 5. Non-DTLS path used predictable verification tags (Critical)
+
+The data channel could run in the clear over UDP with vtags derived from the
+port numbers. DTLS is now enabled in `wr_pc_create`; the plaintext path is
+reachable only through `wr_pc_disable_dtls()`.
+
+### 6. Other important fixes
+
+- `wr_pool_free` had no residency bookkeeping: a double free pushed past
+  `free_stack[cap]` and wrote out of bounds through the arena.
+- `wr_arena_mark_release` assumed malloc returns increasing addresses; it now
+  identifies the marked chunk by containment.
+- DTLS retransmits had no cap or backoff, so a dead peer retransmitted forever.
+- A transcript overflow truncated the hash silently; it now fails the handshake.
+- The SCTP cookie length was fixed at 16, the stream sequence number was shared
+  across all streams, SACK gap blocks were ignored, the advertised receive
+  window was a constant 65535, and giving up after six retransmits was silent.
+- Consent freshness stopped in COMPLETED (RFC 7675), the local-preference term
+  was missing from the candidate priority, and the checks vector grew forever.
+- VP8 payload descriptors ignored the I and K presence bits; H.264 FU-A did not
+  check the fragmented NAL type or that fragments agree on it.
+- The RTP serialiser rejected header extensions; the two-byte RFC 8285 form was
+  not parsed at all.
+- The media frame exposed only the luma plane and ignored the caller's PTS.
+
+### 7. Features added
+
+- SRTCP (RFC 3711 §3.4, RFC 7714 §17): AES-CM and GCM protect/unprotect, labels
+  3/4/5, E-flag/index word, replay.
+- AES-256 SRTP profiles (RFC 6188, RFC 7714).
+- RFC 6525 STREAM RESET on close and on receipt.
+- RFC 8445 §7.3.1.1 role-conflict detection and repair.
+
+## Not fixed (deliberate)
+
+- STUN/TURN client for server-reflexive and relayed candidates.
+- RTCP scheduling and feedback above the now-present SRTCP.
+- Full SACK gap-list generation beyond 8 blocks.
+- Linear retransmit scan in `wr_sctp_step`.
+- SRTP MKI and key-derivation-rate (`kdr`) fields; both are optional in RFC 3711
+  and are not needed for the WebRTC profiles this core targets.
 
 ---
 

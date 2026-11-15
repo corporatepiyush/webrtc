@@ -15,6 +15,18 @@
  * self-delimiting packet. */
 #define WR_DTLS_RECV_MAX   2048u
 #define WR_DTLS_RECVQ_MAX  16u
+/* Retransmit schedule: exponential backoff from 1 s, capped at 60 s, giving up
+ * after WR_DTLS_MAX_RETX tries so a dead peer fails the session instead of
+ * retransmitting forever (RFC 6347 4.2.4). */
+#define WR_DTLS_RETX_BASE_MS 1000u
+#define WR_DTLS_RETX_MAX_MS  60000u
+#define WR_DTLS_MAX_RETX     8u
+
+/* HelloVerifyRequest cookie (RFC 6347 4.2.1). The value this stack generates is
+ * WR_DTLS_COOKIE_LEN bytes; WR_DTLS_COOKIE_MAX is the largest cookie a peer
+ * server may hand back (the length is a single octet on the wire). */
+#define WR_DTLS_COOKIE_LEN 16u
+#define WR_DTLS_COOKIE_MAX 255u
 
 typedef enum {
     WAIT_NONE = 0,
@@ -54,7 +66,6 @@ struct wr_dtls {
     wr_dtls_cipher cwrite;
     wr_dtls_cipher cread;
     bool keys_ready;
-    uint16_t read_epoch;
     uint8_t write_seq[2][6];
     bool rx_seq_valid;
     uint64_t rx_last_seq;
@@ -66,6 +77,11 @@ struct wr_dtls {
     uint8_t flight[WR_DTLS_FLIGHT_MAX];
     size_t flight_len;
     uint64_t last_sent_ms;
+    /* Bumped whenever a new flight is queued, so the retransmit timer restarts
+     * instead of firing immediately for a flight that has not been sent yet. */
+    uint64_t flight_gen;
+    uint64_t last_gen;
+    uint8_t flight_retx;
 
     uint16_t hs_send_seq;
     bool have_recv_hs;
@@ -86,6 +102,19 @@ struct wr_dtls {
     uint8_t recvq_head;
     uint8_t recvq_count;
     uint32_t recvq_drops;
+
+    /* HelloVerifyRequest cookie exchange (RFC 6347 4.2.1). The client stores
+     * the cookie from the server's request and re-sends the ClientHello with
+     * it; the server validates a cookie bound to the endpoint and the
+     * ClientHello random before it allocates handshake state. */
+    uint8_t cookie[WR_DTLS_COOKIE_MAX];
+    uint8_t cookie_len;
+    bool have_cookie;
+    uint8_t cookie_secret[16];
+
+    /* TLS extensions. use_ems selects RFC 7627 (extended master secret);
+     * both peers must agree, which the offer/echo pair guarantees. */
+    bool use_ems;
 };
 
 static inline uint32_t load_be24(const uint8_t *p)

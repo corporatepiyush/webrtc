@@ -54,6 +54,8 @@ typedef struct {
     bool consent_freshness;
     uint32_t consent_interval_ms;
     uint32_t consent_timeout_ms;
+    /* Local preference term of the RFC 8445 candidate-priority formula. */
+    uint16_t local_pref;
 } wr_ice_config;
 
 typedef struct wr_ice_agent wr_ice_agent;
@@ -85,6 +87,9 @@ wr_status wr_ice_input(wr_ice_agent *ag, uint64_t now_ms,
 void wr_ice_close(wr_ice_agent *ag);
 
 wr_ice_state wr_ice_get_state(const wr_ice_agent *ag);
+/* Current role. An agent that detects a role conflict may have switched from
+ * the role it was configured with (RFC 8445 7.3.1.1). */
+wr_ice_role wr_ice_get_role(const wr_ice_agent *ag);
 bool wr_ice_is_complete(const wr_ice_agent *ag);
 bool wr_ice_selected(const wr_ice_agent *ag, wr_endpoint *local,
                      wr_endpoint *remote);

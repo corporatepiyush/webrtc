@@ -22,7 +22,12 @@ void wr_pc_destroy(wr_pc *pc);
 void wr_pc_set_credentials(wr_pc *pc, wr_span_c local_ufrag,
                            wr_span_c local_pwd, wr_span_c remote_ufrag,
                            wr_span_c remote_pwd);
+/* DTLS is enabled by default; this is a no-op unless it was disabled. */
 void wr_pc_enable_dtls(wr_pc *pc);
+/* Turn DTLS off and run the data channel in the clear with predictable
+ * verification tags. Test/benchmark use only; never do this on a real
+ * connection. */
+void wr_pc_disable_dtls(wr_pc *pc);
 bool wr_pc_local_fingerprint(wr_pc *pc, const uint8_t **fp, size_t *len);
 bool wr_pc_set_peer_fingerprint(wr_pc *pc, const uint8_t *fp, size_t len);
 bool wr_pc_dtls_ready(const wr_pc *pc);

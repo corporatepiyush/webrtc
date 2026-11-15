@@ -22,9 +22,9 @@ static void pump(wr_io *from, wr_dtls *to, wr_fuzz_stream *fs,
         if (choice == 0u) {
             continue; /* drop */
         }
-        (void)wr_dtls_input(to, wr_span_upcast(data));
+        (void)wr_dtls_input(to, NULL, wr_span_upcast(data));
         if (choice == 1u) {
-            (void)wr_dtls_input(to, wr_span_upcast(data)); /* duplicate */
+            (void)wr_dtls_input(to, NULL, wr_span_upcast(data)); /* duplicate */
         } else if (choice == 2u) {
             /* replay an older copy by rewinding the length is not possible;
              * re-input the same bytes after a step is enough for replay. */
@@ -104,7 +104,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         pump(io_b, server, &fs, buf, sizeof(buf));
         if (wr_fuzz_stream_below(&fs, 16u) == 0u) {
             wr_span_c junk = wr_span_c_make(data, size < 64u ? size : 64u);
-            (void)wr_dtls_input(client, junk);
+            (void)wr_dtls_input(client, NULL, junk);
         }
         if (wr_dtls_ready(client) && wr_dtls_ready(server)) {
             break;

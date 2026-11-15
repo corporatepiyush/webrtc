@@ -3,6 +3,23 @@
 
 #include <string.h>
 
+/* Drop finished entries in place so the check vector stays bounded; used when
+ * the cap is reached (long-lived sessions run consent checks forever). */
+static void compact_checks(wr_ice_agent *ag)
+{
+    size_t w = 0u;
+    for (size_t i = 0; i < ag->checks.len; ++i) {
+        if (ag->checks.data[i].done) {
+            continue;
+        }
+        if (w != i) {
+            ag->checks.data[w] = ag->checks.data[i];
+        }
+        w++;
+    }
+    ag->checks.len = w;
+}
+
 wr_status wr_ice_send_check(wr_ice_agent *ag, size_t pair_idx, uint64_t now_ms,
                             bool use_candidate, const uint8_t *txid_in,
                             bool record)
@@ -10,19 +27,17 @@ wr_status wr_ice_send_check(wr_ice_agent *ag, size_t pair_idx, uint64_t now_ms,
     if (!ag || pair_idx >= ag->pairs.len || !ag->io) {
         return WR_ERR_STATE;
     }
-    if (!ag->local_ufrag.ptr || !ag->remote_ufrag.ptr || !ag->local_pwd.ptr) {
+    if (!ag->local_ufrag.ptr || !ag->remote_ufrag.ptr || !ag->remote_pwd.ptr) {
         return WR_ERR_STATE;
     }
     uint8_t txid[12];
     if (txid_in) {
         memcpy(txid, txid_in, 12);
     } else {
-        if (ag->rng) {
-            if (wr_rng_fill(ag->rng, txid, sizeof(txid)) != WR_OK) {
-                return WR_ERR_CRYPTO;
-            }
-        } else {
-            memset(txid, 0, sizeof(txid));
+        /* The RNG is required at create time, so a check without an explicit
+         * transaction id always gets a random one. */
+        if (wr_rng_fill(ag->rng, txid, sizeof(txid)) != WR_OK) {
+            return WR_ERR_CRYPTO;
         }
     }
 
@@ -71,8 +86,10 @@ wr_status wr_ice_send_check(wr_ice_agent *ag, size_t pair_idx, uint64_t now_ms,
 
     uint8_t buf[1024];
     size_t n = 0;
-    wr_status st = wr_stun_append_integrity(&m, ag->local_pwd.ptr,
-                                            ag->local_pwd.len, (char *)buf,
+    /* RFC 8445 7.2.4: a Binding request is integrity-protected with the
+     * *peer's* password (the remote credentials), not our own. */
+    wr_status st = wr_stun_append_integrity(&m, ag->remote_pwd.ptr,
+                                            ag->remote_pwd.len, (char *)buf,
                                             sizeof(buf), &n);
     if (st != WR_OK) {
         return st;
@@ -83,10 +100,12 @@ wr_status wr_ice_send_check(wr_ice_agent *ag, size_t pair_idx, uint64_t now_ms,
         return st;
     }
 
-    p->state = WR_ICE_PAIR_IN_PROGRESS;
     p->last_check_ms = now_ms;
     p->checks_sent++;
     ag->checks_sent++;
+    if (p->state != WR_ICE_PAIR_SUCCEEDED) {
+        p->state = WR_ICE_PAIR_IN_PROGRESS;
+    }
 
     if (record) {
         wr_ice_check ck;
@@ -96,6 +115,17 @@ wr_status wr_ice_send_check(wr_ice_agent *ag, size_t pair_idx, uint64_t now_ms,
         ck.retransmits = 0u;
         ck.use_candidate = use_candidate;
         ck.done = false;
+        if (ag->checks.len >= WR_ICE_MAX_CHECKS) {
+            compact_checks(ag);
+        }
+        if (ag->checks.len >= WR_ICE_MAX_CHECKS) {
+            /* Still full: drop the oldest recorded check so the vector cannot
+             * grow without bound across a long-lived session (consent checks
+             * fire every interval forever). */
+            memmove(&ag->checks.data[0], &ag->checks.data[1],
+                    (ag->checks.len - 1u) * sizeof(ag->checks.data[0]));
+            ag->checks.len--;
+        }
         if (!wr_ice_check_vec_push(&ag->checks, ck)) {
             return WR_ERR_NOMEM;
         }
@@ -161,7 +191,10 @@ static size_t find_local_for_addr(const wr_ice_agent *ag,
             return i;
         }
     }
-    return 0u;
+    /* No local candidate matches the address we would answer on. Returning 0
+     * would silently attribute the check to the wrong pair; signal "none"
+     * instead so the caller can reject it. */
+    return (size_t)-1;
 }
 
 static size_t find_remote_for_addr(const wr_ice_agent *ag,
@@ -194,16 +227,78 @@ static bool is_valid_username(const wr_ice_agent *ag, wr_span_c u)
                   ag->remote_ufrag.len) == 0;
 }
 
+/* RFC 8445 7.3.1.1 role-conflict detection and repair. Returns true when the
+ * request must not be processed further (a 487 error response was sent). On a
+ * role switch the request is still processed, using the new role. */
+static bool handle_role_conflict(wr_ice_agent *ag, const wr_stun_msg *m,
+                                 const wr_endpoint *from)
+{
+    const wr_stun_attr *ctrl = wr_stun_attr_find(m, WR_STUN_ATTR_ICE_CONTROLLING);
+    const wr_stun_attr *ctl = wr_stun_attr_find(m, WR_STUN_ATTR_ICE_CONTROLLED);
+    const wr_stun_attr *peer_tie_attr = NULL;
+    bool we_are_controlling = ag->cfg.role == WR_ICE_ROLE_CONTROLLING;
+
+    if (we_are_controlling && ctrl) {
+        peer_tie_attr = ctrl;
+    } else if (!we_are_controlling && ctl) {
+        peer_tie_attr = ctl;
+    } else {
+        return false; /* no conflict (or the peer's role matches ours) */
+    }
+    if (!peer_tie_attr || peer_tie_attr->value.len != 8u) {
+        return false;
+    }
+    uint64_t peer_tie = wr_load_be64(peer_tie_attr->value.ptr);
+    bool peer_wins = we_are_controlling ? (ag->tie_breaker < peer_tie)
+                                        : (ag->tie_breaker >= peer_tie);
+    if (!peer_wins) {
+        /* Retain our role and answer 487 Role Conflict. */
+        wr_stun_msg r;
+        wr_stun_msg_init(&r, ag->a,
+                         wr_stun_type(WR_STUN_METHOD_BINDING,
+                                      WR_STUN_CLASS_ERROR),
+                         m->txid);
+        uint8_t ec[4] = { 0x00u, 0x00u, 0x01u, 0xe7u }; /* 487 = class 4, 87 */
+        if (!wr_stun_attr_add(&r, WR_STUN_ATTR_ERROR_CODE,
+                              wr_span_c_make(ec, sizeof(ec)))) {
+            return true;
+        }
+        uint8_t buf[512];
+        size_t n = 0u;
+        /* A response is signed with the same key the request was verified
+         * with: our local password. */
+        if (wr_stun_append_integrity(&r, ag->local_pwd.ptr, ag->local_pwd.len,
+                                     (char *)buf, sizeof(buf), &n) != WR_OK) {
+            return true;
+        }
+        size_t sent = 0u;
+        (void)wr_io_send(ag->io, from, wr_span_c_make(buf, n), &sent);
+        return true;
+    }
+
+    /* Switch roles and recompute pair priorities (RFC 8445 7.3.1.1). */
+    ag->cfg.role = we_are_controlling ? WR_ICE_ROLE_CONTROLLED
+                                      : WR_ICE_ROLE_CONTROLLING;
+    wr_ice_recompute_pair_priorities(ag);
+    return false;
+}
+
 wr_status wr_ice_handle_request(wr_ice_agent *ag, uint64_t now_ms,
                                 const wr_endpoint *from, wr_stun_msg *m)
 {
-    if (!ag->remote_pwd.ptr || !wr_stun_verify_fingerprint(m) ||
-        !wr_stun_verify_integrity(m, ag->remote_pwd.ptr, ag->remote_pwd.len)) {
+    /* RFC 8445 7.2.2 / 7.3.1: an incoming Binding request is integrity-
+     * protected with *our* (local) password, not the peer's. */
+    if (!ag->local_pwd.ptr || !wr_stun_verify_fingerprint(m) ||
+        !wr_stun_verify_integrity(m, ag->local_pwd.ptr, ag->local_pwd.len)) {
         return WR_ERR_AUTH;
     }
     const wr_stun_attr *user = wr_stun_attr_find(m, WR_STUN_ATTR_USERNAME);
     if (!user || !is_valid_username(ag, user->value)) {
         return WR_ERR_AUTH;
+    }
+    if (handle_role_conflict(ag, m, from)) {
+        /* 487 sent: the request is not processed further. */
+        return WR_OK;
     }
     bool use_candidate =
         wr_stun_attr_find(m, WR_STUN_ATTR_USE_CANDIDATE) != NULL;
